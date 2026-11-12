@@ -12,6 +12,8 @@ __attribute__((constructor)) static void use_process_main_thread(void) {
 static Sound break_sound;
 static Sound place_sound;
 static Sound craft_sound;
+static Sound swing_sound;
+static Sound hurt_sound;
 
 static Sound tone(double frequency, double seconds, double glide) {
     enum { rate = 22050, capacity = 4096 };
@@ -40,6 +42,8 @@ lean_obj_res terria_open(uint32_t width, uint32_t height, b_lean_obj_arg title) 
         break_sound = tone(154.0, 0.09, -620.0);
         place_sound = tone(220.0, 0.08, -920.0);
         craft_sound = tone(410.0, 0.17, 1800.0);
+        swing_sound = tone(272.0, 0.10, -1600.0);
+        hurt_sound = tone(164.0, 0.15, -700.0);
     }
     return lean_io_result_mk_ok(lean_box(0));
 }
@@ -49,6 +53,8 @@ lean_obj_res terria_close(void) {
         UnloadSound(break_sound);
         UnloadSound(place_sound);
         UnloadSound(craft_sound);
+        UnloadSound(swing_sound);
+        UnloadSound(hurt_sound);
         CloseAudioDevice();
     }
     CloseWindow();
@@ -73,9 +79,11 @@ lean_obj_res terria_input(void) {
     if (IsKeyPressed(KEY_E)) bits |= 1u << 5;
     if (IsKeyPressed(KEY_S) || IsKeyPressed(KEY_F5)) bits |= 1u << 6;
     if (IsKeyPressed(KEY_L) || IsKeyPressed(KEY_F9)) bits |= 1u << 7;
-    for (int index = 0; index < 6; ++index) {
+    for (int index = 0; index < 8; ++index) {
         if (IsKeyPressed(KEY_ONE + index)) bits |= 1u << (8 + index);
     }
+    if (IsKeyPressed(KEY_F)) bits |= 1u << 16;
+    if (IsKeyPressed(KEY_R)) bits |= 1u << 17;
     return lean_io_result_mk_ok(lean_box_uint32(bits));
 }
 
@@ -115,7 +123,15 @@ lean_obj_res terria_text(b_lean_obj_arg text, uint32_t x, uint32_t y, uint32_t s
 
 lean_obj_res terria_sound(uint32_t kind) {
     if (IsAudioDeviceReady()) {
-        Sound sound = kind == 0 ? break_sound : kind == 1 ? place_sound : craft_sound;
+        Sound sound;
+        switch (kind) {
+            case 0: sound = break_sound; break;
+            case 1: sound = place_sound; break;
+            case 2: sound = craft_sound; break;
+            case 3: sound = swing_sound; break;
+            case 4: sound = hurt_sound; break;
+            default: return lean_io_result_mk_ok(lean_box(0));
+        }
         if (IsSoundValid(sound)) PlaySound(sound);
     }
     return lean_io_result_mk_ok(lean_box(0));

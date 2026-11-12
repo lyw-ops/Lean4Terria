@@ -4,7 +4,8 @@ set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "$0")/.." && pwd)
 binary=${1:-"$repo_dir/.lake/build/bin/lean4terria"}
-zip_name=Lean4Terria-macos-arm64.zip
+version=0.2.0
+zip_name="Lean4Terria-v$version-macos-arm64.zip"
 
 die() { printf 'package-macos: %s\n' "$*" >&2; exit 1; }
 
@@ -57,8 +58,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>io.github.lyw-ops.Lean4Terria</string>
     <key>CFBundleName</key><string>Lean4Terria</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>0.1.0</string>
+    <key>CFBundleShortVersionString</key><string>$version</string>
+    <key>CFBundleVersion</key><string>$version</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
     <key>LSMinimumSystemVersion</key><string>$minimum</string>
     <key>NSHighResolutionCapable</key><true/>

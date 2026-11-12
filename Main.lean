@@ -43,15 +43,21 @@ private def updateInput (pending : TickInput) (keys : UInt32) (target : Option T
     mine := (if pressed keys 3 then target else none).orElse fun _ => pending.mine
     place := (if pressed keys 4 then target else none).orElse fun _ => pending.place
     craft := pending.craft || pressed keys 5
+    craftTorches := pending.craftTorches || pressed keys 16
+    craftSword := pending.craftSword || pressed keys 17
     selectSlot := (selectedSlot keys).orElse fun _ => pending.selectSlot }
 
 private def playActionSound (before after : GameState) (input : TickInput) : IO Unit := do
-  if input.mine.any (fun pos => (before.world.tile pos).solid && after.world.tile pos == .air) then
+  if input.mine.any (fun pos => before.world.tile pos != .air && after.world.tile pos == .air) then
     sound 0
-  if input.place.any (fun pos => before.world.tile pos == .air && (after.world.tile pos).solid) then
+  if input.place.any (fun pos => before.world.tile pos == .air && after.world.tile pos != .air) then
     sound 1
-  if input.craft && Inventory.count before.inventory .copperPick < Inventory.count after.inventory .copperPick then
+  if (input.craft && Inventory.count before.inventory .copperPick < Inventory.count after.inventory .copperPick) ||
+      (input.craftTorches && Inventory.count before.inventory .torch < Inventory.count after.inventory .torch) ||
+      (input.craftSword && Inventory.count before.inventory .stoneSword < Inventory.count after.inventory .stoneSword) then
     sound 2
+  if after.combat.swing == swingCooldown && before.combat.swing != swingCooldown then sound 3
+  if after.combat.invulnerable == hurtCooldown && before.combat.invulnerable != hurtCooldown then sound 4
 
 private def loadWorld (path : System.FilePath) (fallback : GameState) : IO GameState := do
   match ← Save.read path with
@@ -64,7 +70,6 @@ private def runDesktop (initial : GameState) (savePath : System.FilePath) (smoke
   let mut state := initial
   let mut pending : TickInput := {}
   let mut remaining := 0.0
-  let mut facesLeft := false
   let mut timings : Array Nat := #[]
   openWindow View.width.toUInt32 View.height.toUInt32 "Lean4Terria"
   try
@@ -86,7 +91,6 @@ private def runDesktop (initial : GameState) (savePath : System.FilePath) (smoke
         pending := updateInput pending keys target
       if smoke then
         pending := { horizontal := if timings.size < 40 then 1 else 0 }
-      if pending.horizontal != 0 then facesLeft := pending.horizontal < 0
       remaining := remaining + min 0.25 (← frameTime)
       while remaining ≥ tickSeconds do
         let next := step state pending
@@ -96,7 +100,7 @@ private def runDesktop (initial : GameState) (savePath : System.FilePath) (smoke
         remaining := remaining - tickSeconds
       let camera := View.cameraFor state
       let started ← if smoke then IO.monoNanosNow else pure 0
-      View.draw state camera (camera.target mouseCol mouseRow) facesLeft
+      View.draw state camera (camera.target mouseCol mouseRow) (state.combat.facing < 0)
       if smoke then
         timings := timings.push ((← IO.monoNanosNow) - started)
   finally

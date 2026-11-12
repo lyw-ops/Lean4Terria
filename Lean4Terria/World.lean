@@ -8,7 +8,7 @@ structure TilePos where
   deriving BEq, Repr, Inhabited
 
 inductive Tile where
-  | air | dirt | stone | copper | crystal | workbench | bedrock
+  | air | dirt | stone | copper | crystal | workbench | bedrock | timber | torch
   deriving BEq, Repr, Inhabited
 
 /-- Stable tile identifiers used in the world and save data. -/
@@ -20,6 +20,8 @@ def Tile.code : Tile → UInt8
   | .crystal => 4
   | .workbench => 5
   | .bedrock => 6
+  | .timber => 7
+  | .torch => 8
 
 def Tile.ofCode? : UInt8 → Option Tile
   | 0 => some .air
@@ -29,9 +31,11 @@ def Tile.ofCode? : UInt8 → Option Tile
   | 4 => some .crystal
   | 5 => some .workbench
   | 6 => some .bedrock
+  | 7 => some .timber
+  | 8 => some .torch
   | _ => none
 
-def Tile.solid (tile : Tile) : Bool := tile != .air
+def Tile.solid (tile : Tile) : Bool := tile != .air && tile != .torch
 
 structure World where
   width : Nat
@@ -105,6 +109,8 @@ private def terrainTile (seed : UInt64) (x y width height : Nat) : Tile :=
   -- The opening leads down through two-tile terraces that are also jumpable on return.
   else if 24 ≤ x && x ≤ 75 && floor - 6 ≤ y && y < floor then .air
   else if 24 ≤ x && x ≤ 75 && (y == floor || y == floor + 1) then .stone
+  else if (x == 14 || (x ≥ 80 && sample seed x 0 < 20)) && ground - 2 ≤ y && y < ground then
+    .timber
   else if y < ground then .air
   else if y < ground + 4 then .dirt
   else if y ≥ ground + 6 && noise (seed + 1) x y 15 11 < 88 then .air
