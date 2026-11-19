@@ -4,7 +4,7 @@ set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "$0")/.." && pwd)
 binary=${1:-"$repo_dir/.lake/build/bin/lean4terria"}
-version=0.2.0
+version=3.33.0
 zip_name="Lean4Terria-v$version-macos-arm64.zip"
 
 die() { printf 'package-macos: %s\n' "$*" >&2; exit 1; }
@@ -75,6 +75,14 @@ entries=$(zipinfo -1 "$stage/$zip_name")
 if printf '%s\n' "$entries" | grep -Eq '(^|/)(\._|__MACOSX/)'; then
   die 'ZIP contains AppleDouble metadata entries.'
 fi
+# Textures and fonts are read from the local Terraria install at runtime.
+extra_files=$(printf '%s\n' "$entries" | awk '
+  /\/$/ { next }
+  /^Lean4Terria\.app\/Contents\/(Info\.plist|MacOS\/lean4terria|_CodeSignature\/CodeResources)$/ { next }
+  /^Lean4Terria\.app\/Contents\/Resources\/(Lean|raylib)-LICENSE\.txt$/ { next }
+  { print }
+')
+[[ -z "$extra_files" ]] || die "ZIP contains unexpected files: $extra_files"
 ditto -x -k "$stage/$zip_name" "$stage/verify"
 codesign --verify --strict --deep "$stage/verify/Lean4Terria.app"
 

@@ -27,6 +27,11 @@ def playerAmbientLevel : Nat := 6
 /-- Light given off by a tile itself. -/
 def emission : Tile → Nat
   | .torch => placedTorchLevel
+  | .hellforge | .adamantiteForge | .titaniumForge => 9
+  | .ruinAltar => 12
+  | .demonAltar | .crimsonAltar => 9
+  | .shadowOrb | .crimsonHeart => 10
+  | .planteraBulb => 5
   | _ => 0
 
 end Lighting
@@ -81,13 +86,17 @@ Compute light for a frame.
 * `viewOrigin`, `viewWidth`, `viewHeight`: first tile and size of the viewport.
 * `player`: the player's center tile, which glows faintly, or brightly when
   `holdingTorch`.
+* `outdoorLevel`: brightness of open sky, up to `Lighting.maxLevel`.
+* `extraEmission`: light from non-tile sources such as magma, sampled in open cells.
 
 Open air above the generated surface (`groundHeight`) is lit as sky, down to the
 first solid tile in each column, so shafts dug below the original surface stay
 dark and roofs cast shade.
 -/
 def computeLighting (world : World) (seed : UInt64) (viewOrigin : TilePos)
-    (viewWidth viewHeight : Nat) (player : TilePos) (holdingTorch : Bool) : LightField := Id.run do
+    (viewWidth viewHeight : Nat) (player : TilePos) (holdingTorch : Bool)
+    (outdoorLevel : Nat := Lighting.skyLevel)
+    (extraEmission : TilePos → Nat := fun _ => 0) : LightField := Id.run do
   let mapWidth : Int := world.width
   let mapHeight : Int := world.height
   let minX := max viewOrigin.x 0
@@ -110,9 +119,11 @@ def computeLighting (world : World) (seed : UInt64) (viewOrigin : TilePos)
   let mut sources : Array (Nat × Nat) := #[]
   for row in [:height] do
     for col in [:width] do
-      let tile := world.tile ⟨originX + col, originY + row⟩
-      solid := solid.push (if tile.solid then 1 else 0)
-      let level := emission tile
+      let pos : TilePos := ⟨originX + col, originY + row⟩
+      let tile := world.tile pos
+      let blocked := tile.solid
+      solid := solid.push (if blocked then 1 else 0)
+      let level := max (emission tile) (if blocked then 0 else min maxLevel (extraEmission pos))
       if level > 0 then
         sources := sources.push (row * width + col, level)
 
@@ -123,14 +134,16 @@ def computeLighting (world : World) (seed : UInt64) (viewOrigin : TilePos)
     flood := flood.raise index level true
 
   -- Sky light falls straight down until the original surface or a solid tile.
+  let sky := min outdoorLevel maxLevel
   let windowBottom := (originY + height).toNat
+  let evilTerrain := (evilAltars seed)[0]?.any (fun altar => world.tile altar == altarTile seed)
   for col in [:width] do
     let x := (originX + col).toNat
-    let stop := min (groundHeight seed x) windowBottom
+    let stop := min (if evilTerrain then evilSurfaceHeight seed x else groundHeight seed x) windowBottom
     for y in [:stop] do
       if (world.tile ⟨x, y⟩).solid then break
       if (y : Int) ≥ originY then
-        flood := flood.raise ((y - originY).toNat * width + col) skyLevel true
+        flood := flood.raise ((y - originY).toNat * width + col) sky true
 
   -- The player always lights their surroundings a little.
   if originX ≤ player.x && player.x < originX + width &&
