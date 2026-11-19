@@ -2,10 +2,21 @@ import Lean4Terria.Physics
 
 namespace Lean4Terria
 
-def maxHealth : Nat := 5
+def healthPerHeart : Nat := 20
+def maxHealth : Nat := 100
+def maxLifeCrystals : Nat := 15
 def crawlerMaxHealth : Nat := 3
 def hurtCooldown : Nat := 48
+def npcContactKnockbackX : Int := 72
+def lavaHurtCooldown : Nat := 40
+def lavaBurnTicks : Nat := 420
+def burnDamageInterval : Nat := 15
+def maxRegenTime : Nat := 3600
+def regenPointThreshold : Nat := 120
+def classicRespawnTicks : Nat := 600
+def spawnInvulnerability : Nat := 180
 def swingCooldown : Nat := 18
+def maxSwordUseTime : Nat := 22
 def crawlerHopDelay : Nat := 78
 
 structure Crawler where
@@ -21,7 +32,78 @@ structure CombatState where
   facing : Int
   crawler : Option Crawler
   cleared : Bool
+  lifeCrystals : Nat := 0
+  onFire : Nat := 0
+  fireProgress : Nat := 0
+  lavaCooldown : Nat := 0
+  regenTime : Nat := 0
+  regenProgress : Nat := 0
   deriving BEq, Repr
+
+def CombatState.healthLimit (combat : CombatState) : Nat :=
+  maxHealth + combat.lifeCrystals * healthPerHeart
+
+def CombatState.afterDefeat (combat : CombatState) : CombatState :=
+  { combat with
+    health := 0
+    invulnerable := 0
+    swing := 0
+    facing := 1
+    onFire := 0
+    fireProgress := 0
+    lavaCooldown := 0
+    regenTime := 0
+    regenProgress := 0 }
+
+def CombatState.afterRespawn (combat : CombatState) : CombatState :=
+  { combat with health := max maxHealth (combat.healthLimit / 2), invulnerable := spawnInvulnerability }
+
+def CombatState.hurt (combat : CombatState) (damage : Nat) : CombatState :=
+  { combat with health := combat.health - damage, invulnerable := hurtCooldown, regenTime := 0 }
+
+/-- Classic contact damage at zero luck, given the draw from the 31-value roll.
+Round the varied Single to even, then keep the half-point defense result until
+after selecting the General immunity duration. -/
+def classicNpcContactDamage (base roll defense : Nat) (afterVariance : Nat := 1) : Nat × Nat :=
+  let percent := (Int32.ofNat (roll % 31) - 15).toFloat32
+  let varied := (Int32.ofNat base).toFloat32 * (1 + percent * 0.01)
+  let whole := varied.toUInt32.toNat
+  let fraction := varied - (Int32.ofNat whole).toFloat32
+  let rounded := if fraction > 0.5 || (fraction == 0.5 && whole % 2 == 1) then whole + 1 else whole
+  let doubled := max 2 (2 * rounded * afterVariance - defense)
+  (doubled / 2, if doubled == 2 then 20 else 40)
+
+private def roundRate (numerator denominator : Nat) : Nat :=
+  let whole := numerator / denominator
+  let rest := numerator % denominator
+  if 2 * rest > denominator || (2 * rest == denominator && whole % 2 == 1) then whole + 1
+  else whole
+
+/-- Natural recovery ramps with time since a hit. Fire drains one HP every
+15 ticks, including when the ordinary damage immunity timer is active. -/
+def CombatState.tickLife (combat : CombatState) (standingStill wet : Bool) (honey := false) : CombatState :=
+  if combat.health == 0 then combat
+  else if combat.onFire > 0 && !wet then
+    let ticks := combat.onFire - 1
+    let progress := combat.fireProgress + if honey then combat.onFire % 2 else 1
+    { combat with
+      health := combat.health - progress / burnDamageInterval
+      onFire := ticks
+      fireProgress := if ticks == 0 then 0 else progress % burnDamageInterval
+      regenTime := 0
+      regenProgress := 0 }
+  else
+    let time := min maxRegenTime (combat.regenTime + if honey then 3 else 1)
+    let effective := if time ≤ 1800 then time / 300 else 6 + (time - 1800) / 600
+    let activity := if standingStill then 5 else 2
+    let rate := roundRate ((17 * combat.healthLimit + 1200) * effective * activity) 32000
+    let progress := combat.regenProgress + rate + if honey then 2 else 0
+    { combat with
+      health := min combat.healthLimit (combat.health + progress / regenPointThreshold)
+      onFire := 0
+      fireProgress := 0
+      regenTime := time
+      regenProgress := if combat.health == combat.healthLimit then 0 else progress % regenPointThreshold }
 
 inductive CombatEvent where
   | swing | hitCrawler | defeatedCrawler | hurt | respawned
@@ -30,7 +112,7 @@ inductive CombatEvent where
 private def crawlerLeft : Int := 66 * tileUnits
 private def crawlerRight : Int := 76 * tileUnits
 
-private def bodiesOverlap (a b : Player) : Bool :=
+def bodiesOverlap (a b : Player) : Bool :=
   (a.x - b.x).natAbs < playerWidth.toNat && (a.y - b.y).natAbs < playerHeight.toNat
 
 private def standingAt (world : World) (col floor : Int) : Option Player :=
@@ -48,7 +130,7 @@ private def outwardOffset (index : Nat) : Int :=
   let distance : Int := (index + 1) / 2
   if index % 2 == 0 then -distance else distance
 
-private def findStandingNear (world : World) (col floor : Int) (columns rows : Nat)
+def findStandingNear (world : World) (col floor : Int) (columns rows : Nat)
     (acceptable : Player → Bool) : Option Player := Id.run do
   for row in [:2 * rows + 1] do
     for column in [:2 * columns + 1] do
@@ -64,7 +146,7 @@ def initialCombat (world : World) : CombatState :=
     { body, health := crawlerMaxHealth, hopIn := crawlerHopDelay : Crawler }
   { health := maxHealth, invulnerable := 0, swing := 0, facing := 1, crawler, cleared := false }
 
-private def respawn (world : World) (previous : Player) (crawler : Option Crawler) : Player := Id.run do
+def respawn (world : World) (previous : Player) (crawler : Option Crawler) : Player := Id.run do
   let safe := fun body => !crawler.any (fun enemy => bodiesOverlap body enemy.body)
   if let some body := findStandingNear world 19 40 12 12 safe then
     return body
@@ -108,44 +190,71 @@ private def clearSwordPath (world : World) (player enemy : Player) : Bool := Id.
     if (world.tile ⟨x / tileUnits, y / tileUnits⟩).solid then return false
   return true
 
+def swordReaches (world : World) (player enemy : Player) (facing : Int)
+    (allowOverlap : Bool) (ignoreTerrain := false) : Bool :=
+  let dx := enemy.x - player.x
+  let dy := enemy.y - player.y
+  let aimedAt := 0 ≤ facing * dx || (allowOverlap && bodiesOverlap player enemy)
+  aimedAt && dx.natAbs ≤ (tileUnits * 5 / 2).toNat && dy.natAbs ≤ playerHeight.toNat &&
+    (ignoreTerrain || clearSwordPath world player enemy)
+
+/-- A shortsword follows the cursor along a narrow, two-tile thrust. -/
+def shortswordReaches (world : World) (player enemy : Player) (target : TilePos) (facing : Int)
+    (ignoreTerrain := false) : Bool :=
+  let centerX := player.x + playerWidth / 2
+  let centerY := player.y + playerHeight / 2
+  let dx := enemy.x - player.x
+  let dy := enemy.y - player.y
+  let cursorX := target.x * tileUnits + tileUnits / 2 - centerX
+  let cursorY := target.y * tileUnits + tileUnits / 2 - centerY
+  let aimX := if target == player.centerTile then facing * tileUnits else cursorX
+  let aimY := if target == player.centerTile then 0 else cursorY
+  let lengthSquared := aimX * aimX + aimY * aimY
+  let alignment := dx * aimX + dy * aimY
+  let offset := dx * aimY - dy * aimX
+  alignment ≥ 0 && dx * dx + dy * dy ≤ (2 * tileUnits) * (2 * tileUnits) &&
+    offset * offset ≤ lengthSquared * (tileUnits / 2) * (tileUnits / 2) &&
+    (ignoreTerrain || clearSwordPath world player enemy)
+
 private def trySwing (world : World) (player : Player) (combat : CombatState)
-    (target : TilePos) : CombatState × CombatEvent := Id.run do
+    (target : TilePos) (damage delay : Nat) (shortsword canStrikeCrawler : Bool) : CombatState × CombatEvent := Id.run do
   let aim := target.x - player.centerTile.x
   let facing := if aim < 0 then -1 else if aim > 0 then 1 else combat.facing
-  let combat := { combat with facing, swing := swingCooldown }
+  let combat := { combat with facing, swing := delay }
   if let some enemy := combat.crawler then
-    let dx := enemy.body.x - player.x
-    let dy := enemy.body.y - player.y
-    let aimedAt := 0 ≤ facing * dx || (aim == 0 && bodiesOverlap player enemy.body)
-    let inReach := aimedAt && dx.natAbs ≤ (tileUnits * 5 / 2).toNat &&
-      dy.natAbs ≤ playerHeight.toNat
-    if inReach && clearSwordPath world player enemy.body then
-      if enemy.health ≤ 1 then
+    let reaches := if shortsword then shortswordReaches world player enemy.body target facing
+      else swordReaches world player enemy.body facing (aim == 0)
+    if canStrikeCrawler && reaches then
+      if enemy.health ≤ damage then
         return ({ combat with crawler := none, cleared := true }, .defeatedCrawler)
-      return ({ combat with crawler := some { enemy with health := enemy.health - 1 } }, .hitCrawler)
+      return ({ combat with crawler := some { enemy with health := enemy.health - damage } }, .hitCrawler)
   return (combat, .swing)
 
 /-- Advance combat after player movement. A sword strike resolves before enemy movement
 and contact damage, so defeating the crawler on that tick also prevents its contact hit. -/
 def advanceCombat (world : World) (player : Player) (combat : CombatState) (horizontal : Int)
-    (attack : Option TilePos) : Player × CombatState × Option CombatEvent := Id.run do
+    (attack : Option TilePos) (damage : Nat := 1) (delay := swingCooldown) (shortsword := false)
+    (immunityTicked := false) (canStrikeCrawler := true) :
+    Player × CombatState × Option CombatEvent := Id.run do
   let facing := if horizontal < 0 then -1 else if horizontal > 0 then 1 else combat.facing
-  let mut combat := { combat with facing, invulnerable := combat.invulnerable - 1, swing := combat.swing - 1 }
+  let mut combat := { combat with
+    facing
+    invulnerable := if immunityTicked then combat.invulnerable else combat.invulnerable - 1
+    lavaCooldown := combat.lavaCooldown - 1
+    swing := combat.swing - 1 }
   let mut event := none
   if let some target := attack then
     if combat.swing == 0 then
-      let (next, strike) := trySwing world player combat target
+      let (next, strike) := trySwing world player combat target damage delay shortsword canStrikeCrawler
       combat := next
       event := some strike
   if let some crawler := combat.crawler then
     let crawler := moveCrawler world player crawler
     combat := { combat with crawler := some crawler }
     if combat.invulnerable == 0 && bodiesOverlap player crawler.body then
-      if combat.health ≤ 1 then
-        let player := respawn world player combat.crawler
-        return (player, { combat with health := maxHealth, invulnerable := hurtCooldown, swing := 0, facing := 1 },
-          some .respawned)
-      return (player, { combat with health := combat.health - 1, invulnerable := hurtCooldown }, some .hurt)
+      if combat.health ≤ healthPerHeart then
+        return (player, combat.afterDefeat, some .respawned)
+      return (player, combat.hurt healthPerHeart, some .hurt)
   return (player, combat, event)
 
 end Lean4Terria
