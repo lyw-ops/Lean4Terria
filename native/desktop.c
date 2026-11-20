@@ -422,6 +422,19 @@ lean_obj_res terria_original_texture_size(b_lean_obj_arg asset) {
     return lean_io_result_mk_ok(lean_box_uint64(dimensions));
 }
 
+static Texture2D original_texture(const char *name);
+
+/* BEGIN B-ZONE playerdraw-texture-size (S05): the size of a texture as the asset loader actually loaded it
+   (`Images/` prefix stripped like the sprite calls take it); 0 when it did not load. */
+lean_obj_res terria_original_loaded_texture_size(b_lean_obj_arg asset) {
+    Texture2D texture = original_texture(lean_string_cstr(asset));
+    uint64_t dimensions = 0;
+    if (texture.id && texture.width > 0 && texture.height > 0)
+        dimensions = (uint64_t)(uint32_t)texture.width | ((uint64_t)(uint32_t)texture.height << 32);
+    return lean_io_result_mk_ok(lean_box_uint64(dimensions));
+}
+/* END B-ZONE playerdraw-texture-size */
+
 static Texture2D load_original_texture(const char *name) {
     size_t bytes = 0;
     unsigned char *data = read_original_xnb("Images", name, &bytes);
@@ -612,6 +625,11 @@ static Sound original_tink[3];
 static Sound original_item_swing[3];
 static Sound original_snow_ice[3];
 static Sound original_snow_ice_instances[3];
+/* BEGIN B-ZONE quick-potion-voices (S02 open item): Item_2 / Item_3, the QuickHeal / QuickMana use
+   sounds (LegacySoundPlayer type 2, styles 2 and 3 stop their previous instance, IL_0590..05dd). */
+static Sound original_item_potion[2];
+static Sound original_item_potion_instances[2];
+/* END B-ZONE quick-potion-voices */
 static Sound original_pickup_grab;
 static Sound original_grab_instance;
 /* Player.PlayHurtSound: male (type 1), female (type 20), default voice (type 42 style 317). */
@@ -762,6 +780,10 @@ lean_obj_res terria_open(uint32_t width, uint32_t height, b_lean_obj_arg title) 
             original_item_swing[i] = load_original_sound(name);
             snprintf(name, sizeof name, "Item_%d", 48 + i);
             original_snow_ice[i] = load_original_sound(name);
+            if (i < 2) {
+                snprintf(name, sizeof name, "Item_%d", 2 + i);
+                original_item_potion[i] = load_original_sound(name);
+            }
             snprintf(name, sizeof name, "Player_Hit_%d", i);
             original_player_hit[i] = load_original_sound(name);
             snprintf(name, sizeof name, "Female_Hit_%d", i);
@@ -839,6 +861,12 @@ lean_obj_res terria_close(void) {
             original_snow_ice_instances[i] = (Sound){0};
             if (IsSoundValid(original_snow_ice[i])) UnloadSound(original_snow_ice[i]);
             original_snow_ice[i] = (Sound){0};
+            if (i < 2) {
+                if (IsSoundValid(original_item_potion_instances[i])) UnloadSoundAlias(original_item_potion_instances[i]);
+                original_item_potion_instances[i] = (Sound){0};
+                if (IsSoundValid(original_item_potion[i])) UnloadSound(original_item_potion[i]);
+                original_item_potion[i] = (Sound){0};
+            }
             if (IsSoundValid(original_tile_dig[i])) UnloadSound(original_tile_dig[i]);
             original_tile_dig[i] = (Sound){0};
             if (IsSoundValid(original_tink[i])) UnloadSound(original_tink[i]);
@@ -1642,6 +1670,9 @@ lean_obj_res terria_original_tile_hit_sound(uint32_t type, uint32_t style,
             play_original_alias(original_coin[variation], volume, pan, pitch);
         } else if (type == 7 && variation == 0) {
             replace_original_voice(&original_grab_instance, original_pickup_grab, volume, pan, pitch);
+        } else if (type == 2 && (style == 2 || style == 3) && variation == 0) {
+            replace_original_voice(&original_item_potion_instances[style - 2],
+                original_item_potion[style - 2], volume, pan, pitch);
         } else if (type == 2 && style >= 48 && style <= 50 && variation == style) {
             replace_original_voice(&original_snow_ice_instances[style - 48],
                 original_snow_ice[style - 48], volume, pan, pitch);

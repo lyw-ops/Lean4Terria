@@ -23,6 +23,9 @@ import Lean4Terria.OriginalCombatTextChannel
 import Lean4Terria.OriginalSkeletron
 import Lean4Terria.OriginalStarterMelee
 import Lean4Terria.OriginalWaterDust
+-- BEGIN B-ZONE projectiles-import (S03)
+import Lean4Terria.OriginalProjectiles
+-- END B-ZONE projectiles-import
 
 namespace Lean4Terria.OriginalCombat
 
@@ -103,6 +106,10 @@ inductive Projectile where
   | stab (stab : Stab)
   | guideArrow (arrow : OriginalForestGuideArrow.Arrow)
   | gravestone (grave : OriginalPlayerDeath.Gravestone)
+  -- BEGIN B-ZONE projectiles-kind (S03)
+  /-- A local player's Wooden Arrow (type 1, `OriginalPlayerArrows`), fired by the bow. -/
+  | woodenArrow (arrow : OriginalPlayerArrows.Arrow)
+  -- END B-ZONE projectiles-kind
   deriving Inhabited
 
 def Projectile.active : Projectile → Bool
@@ -110,12 +117,28 @@ def Projectile.active : Projectile → Bool
   | .stab blade => blade.active
   | .guideArrow arrow => arrow.active
   | .gravestone grave => grave.timeLeft > 0
+  | .woodenArrow arrow => arrow.active
 
 private def Projectile.direction : Projectile → Int
   | .empty => 1
   | .stab blade => blade.direction
   | .guideArrow arrow => arrow.direction
   | .gravestone grave => grave.direction
+  | .woodenArrow arrow => arrow.direction
+
+-- BEGIN B-ZONE projectiles-slot-info (S03)
+/-- What `NewProjectileSetup` / `FindOldestProjectile` read of one slot: `active`, `netImportant` and
+`timeLeft`. None of these kinds is `netImportant` (declared: only observable on a pool whose 1000 slots
+are all live). -/
+def Projectile.info (projectile : Projectile) : OriginalPlayerArrows.SlotInfo :=
+  { active := projectile.active, netImportant := false
+    timeLeft := match projectile with
+      | .empty => 0
+      | .stab blade => blade.timeLeft
+      | .guideArrow arrow => arrow.timeLeft
+      | .gravestone grave => grave.timeLeft
+      | .woodenArrow arrow => arrow.timeLeft }
+-- END B-ZONE projectiles-slot-info
 
 private def Projectile.reuseSlot (projectile previous : Projectile) : Projectile :=
   match projectile with
@@ -136,7 +159,20 @@ structure State where
   textBoundary : Option String := none
   use : Use := {}
   weapon : Option Nat := none
-  projectiles : Array Projectile := #[]
+  -- BEGIN B-ZONE projectiles-pool (S03)
+  /-- `Main.projectile` with `Projectile.slotGenerations`: every kind of this session lives in ONE
+  `OriginalProjectiles.Pool` as `.other info projectile` (allocation `NewProjectileSetup`, keys, the
+  ascending update loop). The generations are never reset (one world per process here). -/
+  projectiles : OriginalProjectiles.Pool Projectile := {}
+  /-- A spawn or update this session has no owner for (an `unowned` slot, a reused slot whose old
+  direction is unknown, an unresolved arrow strike sound): the caller stops at it. -/
+  projectileBoundary : Option String := none
+  -- END B-ZONE projectiles-pool
+  -- BEGIN B-ZONE weapons-stab-crit (S04)
+  /-- `Projectile.CritChance` of the live stab: `Player.GetWeaponCrit(item)` when it was shot (one local
+  player, one stab at a time). The `.cctor`/ResetEffects value of `meleeCrit` is 4. -/
+  stabCrit : Int := 4
+  -- END B-ZONE weapons-stab-crit
   guideDust : Array OriginalForestGuideArrow.DustParticle := #[]
   /-- Main.maxDustToDraw; physical allocation still has6000 slots. -/
   dustDrawBudget : Nat := 6000
@@ -207,18 +243,51 @@ private def localNpcTarget (body : Body) (dead : Bool) (itemAnimation : Nat := 0
   { index := 0, dead, position := body.position, width := body.width, height := body.height
     itemAnimation }
 
-def State.insertProjectile (state : State) (projectile : Projectile) : State :=
-  if let some index := state.projectiles.findIdx? (fun slot => !slot.active) then
-    let projectile := projectile.reuseSlot state.projectiles[index]!
-    { state with projectiles := state.projectiles.set! index projectile }
-  else if state.projectiles.size < 1000 then
-    { state with projectiles := state.projectiles.push projectile }
-  else state
+-- BEGIN B-ZONE projectiles-access (S03)
+/-- The projectile in `Main.projectile[slot]` (`.empty` for a slot never used or unowned). -/
+def State.projectileAt (state : State) (slot : Nat) : Projectile :=
+  match state.projectiles.slots.getD slot none with
+  | some (.other _ projectile) => projectile
+  | some (.woodenArrow arrow) => .woodenArrow arrow
+  | _ => .empty
 
-def State.clearStabs (state : State) : State :=
-  { state with projectiles := state.projectiles.map fun
-      | .stab stab => .stab { stab with active := false, timeLeft := 0 }
-      | slot => slot }
+/-- Every slot `0..1000` in index order (`.empty` for unused / unowned slots), for drawing. -/
+def State.projectileList (state : State) : Array Projectile :=
+  (Array.range state.projectiles.slots.size).map state.projectileAt
+
+/-- Write a slot back with its `SlotInfo` recomputed from the value. -/
+def State.setProjectile (state : State) (slot : Nat) (projectile : Projectile) : State :=
+  { state with projectiles := { state.projectiles with
+      slots := state.projectiles.slots.set! slot (some (.other projectile.info projectile)) } }
+
+/-- `Projectile.NewProjectile` through the pool: `NewProjectileSetup` (first inactive slot, else
+`FindOldestProjectile`) and `ProjectileKey(myPlayer, slot, ++slotGenerations[slot])`. `SetDefaults` does not
+reset `Projectile.direction`, so a Guide arrow keeps the direction the slot's previous occupant left
+(`reuseSlot`). Returns the slot. -/
+def State.newProjectile (state : State) (projectile : Projectile) : State × Nat :=
+  let slot := OriginalPlayerArrows.allocate state.projectiles.infos
+  let (projectile, boundary) : Projectile × Option String :=
+    match state.projectiles.slots.getD slot none with
+    | some (.other _ previous) => (projectile.reuseSlot previous, none)
+    | some (.woodenArrow arrow) => (projectile.reuseSlot (.woodenArrow arrow), none)
+    | some (.unowned _ type) =>
+      match projectile with
+      | .guideArrow _ => (projectile, some s!"NewProjectile into slot {slot}: direction left by unowned type {type} unknown")
+      | _ => (projectile, none)
+    | none => (projectile, none)
+  let (pool, slot, _) := state.projectiles.newProjectile 0 fun _ _ => .other projectile.info projectile
+  ({ state with projectiles := pool, projectileBoundary := state.projectileBoundary.or boundary }, slot)
+-- END B-ZONE projectiles-access
+
+def State.insertProjectile (state : State) (projectile : Projectile) : State :=
+  (state.newProjectile projectile).1
+
+def State.clearStabs (state : State) : State := Id.run do
+  let mut state := state
+  for slot in [:state.projectiles.slots.size] do
+    if let .stab stab := state.projectileAt slot then
+      state := state.setProjectile slot (.stab { stab with active := false, timeLeft := 0 })
+  return state
 
 def Actor.slime? : Actor → Option Slime
   | .greenSlime slime => some slime
@@ -867,18 +936,24 @@ def State.useWeapon (state : State) (weapon : Weapon) (body : OriginalPlayerColl
     (direction : Int) (held : Bool) (mouse : OriginalCollision.Vector) (grid : Grid)
     (random : UnifiedRandom) (loot : Loot.Context)
     (view : Option OriginalForestGuideArrow.Viewport := none) (noItems : Bool := false)
-    (audio : Option OriginalTileHitEffects.Context := none) : State × Array Drop × UnifiedRandom :=
+    (audio : Option OriginalTileHitEffects.Context := none)
+    -- BEGIN B-ZONE weapons-use-crit (S04): `Player.GetWeaponCrit(item)` of the held weapon
+    (meleeCrit : Int := 4)
+    -- END B-ZONE weapons-use-crit
+    : State × Array Drop × UnifiedRandom :=
   let use := { state.use with direction }.beginFrame
   -- Cursed prevents a new start. An existing swing and its projectile phase continue.
   let itemInput := held && (!noItems || use.itemAnimation > 0)
-  let result := OriginalStarterMelee.useFrame weapon { owner body with luck := loot.luck } use itemInput mouse
+  let result := OriginalStarterMelee.useFrame weapon { owner body with luck := loot.luck, meleeCrit } use itemInput mouse
     (state.actors.map Actor.toNpc) (some grid) random (onKill state loot) (onStrike state grid view)
     (state.npcText) (onStrikeSound state audio)
   -- Failed starts still consume the physical release latch in native ItemCheck.
   let use : Use := { result.use with releaseUseItem := !held }
   let weapon := if use.itemAnimation > 0 then some weapon.type else none
   let state := ({ state.withHits result.npcs result.hits body audio.isSome loot with use, weapon }).acceptNpcText result.text
-  let state := result.stab.elim state (fun stab => state.insertProjectile (.stab stab))
+  let state := result.stab.elim state (fun stab =>
+    let inserted := state.insertProjectile (.stab stab)
+    { inserted with stabCrit := meleeCrit })
   (state, dropsFromHits result.hits, result.random)
 
 private def nearbyAmount (nearby : Array (Nat × Float32)) : Float32 :=
@@ -963,6 +1038,34 @@ def npcAmbientHook (audio : OriginalNightEnemies.AudioContext) :
         variation := (p.asset.back.toNat - '0'.toNat), volume := p.volume, pan := p.pan, pitch := p.pitch } :
         OriginalTileHitEffects.PlayedSound))
     | .error _ => (random, none)
+
+/-- An Angry Bones door interaction's legacy sounds at their AI call sites (`WorldGen.KillTile(fail)` →
+`KillTile_PlaySounds` Dig, then `WorldGen.OpenDoor` DoorOpen): an audible one draws from the NPC stream —
+Dig its variation `Next(3)` and pitch `Next(-10, 11)` (the released night-enemy channel), DoorOpen its pitch
+`Next(-20, 21)` at the channel's own attenuation, volume unscaled (native luck_contact_bones_long, tick 264). -/
+def doorSoundHook (audio : OriginalNightEnemies.AudioContext) (s : OriginalDoor.Sound)
+    (random : OriginalGreenSlime.Rng) : Except String (OriginalGreenSlime.Rng × Option OriginalTownCombat.PlayedSound) := do
+  let position : OriginalCollision.Vector := ⟨OriginalCollision.single s.x, OriginalCollision.single s.y⟩
+  if s.typeId == 0 then
+    let out ← OriginalNightEnemies.playAudio audio {} ⟨0, s.style, position⟩ random
+    return (out.random, out.played.map fun p =>
+      { typeId := 0, style := s.style.toNat, variation := (p.asset.back.toNat - '0'.toNat)
+        volume := p.volume, pan := p.pan, pitch := p.pitch })
+  if s.typeId != 8 then throw s!"door legacy sound {s.typeId} not ported"
+  -- the channel's gates and attenuation (OriginalNightEnemies.resolveAudio), then LegacySoundPlayer type 8
+  if audio.dedicatedServer || !audio.supported || audio.volume == 0 then return (random, none)
+  let global := s.x == -1 || s.y == -1
+  if !global && (audio.generating || audio.netMode == 2) then return (random, none)
+  let dx := position.x - audio.cameraCenter.x
+  let dy := position.y - audio.cameraCenter.y
+  let distance := Float32.sqrt (dx * dx + dy * dy)
+  if !global && !(distance < audio.attenuationDistance) then return (random, none)
+  let pan := if global then 0 else max (-1) (min 1 (dx / (audio.viewWidth * 0.5)))
+  let volume := min 1 ((if global then 1 else max 0 (min 1 (1 - distance / audio.attenuationDistance))) * audio.volume)
+  if !(volume > 0) then return (random, none)
+  let (pitch, random) := random.nextRange (-20) 21
+  return (random, some { typeId := 8, style := s.style.toNat, variation := 0, volume, pan
+                         pitch := OriginalCollision.single pitch * 0.01 })
 
 private def State.mechanicHit (state : State) (hit : Option OriginalDungeonMechanic.Hit)
     (client : Bool := false) : State :=
@@ -1102,13 +1205,24 @@ def State.advanceNpcs (state : State) (world : OriginalGreenSlime.World) (body :
       | .ok next =>
         actors := actors.set! index (.angryBones next.enemy)
         world := { world with grid := OriginalDoor.applyGrid world.grid next.tileEdits }
+        -- the door sounds are the last draws of this AI call: resolved on the stream it leaves
+        let mut rng := next.rng
+        let mut doorPlayed : Array OriginalTownCombat.PlayedSound := #[]
+        let mut doorBoundary : Option String := none
+        if let some a := audio then
+          for snd in next.doorSounds do
+            match doorSoundHook a snd rng with
+            | .ok (r, played) => rng := r; doorPlayed := doorPlayed ++ played.toArray
+            | .error why => doorBoundary := doorBoundary.or (some why)
         combat := { combat with
           npcSounds := combat.npcSounds ++ (next.ambientPlayed.map fun p =>
             ({typeId := 14, style := 1, variation := p.variation, volume := p.volume, pan := p.pan, pitch := p.pitch} :
-              OriginalTownCombat.PlayedSound)).toArray
+              OriginalTownCombat.PlayedSound)).toArray ++ doorPlayed
           npcTileEdits := combat.npcTileEdits ++ next.tileEdits
-          doorSounds := combat.doorSounds ++ next.doorSounds }
-        random := next.rng
+          -- without a client audio context the desktop's fixed door sounds remain the record
+          doorSounds := if audio.isSome then combat.doorSounds else combat.doorSounds ++ next.doorSounds }
+        if let some why := doorBoundary then npcBoundary := npcBoundary.or (some (index, why))
+        random := rng
         nearbyActiveNPCs := nearbyActiveNPCs + nearbyAmount next.nearby
         noSpawnCycle := noSpawnCycle || !next.enemy.body.active
       | .error why =>
@@ -1260,29 +1374,58 @@ private def Actor.arrowTarget (actor : Actor) : Option OriginalForestGuideArrow.
 
 def State.advanceProjectile (state : State) (index : Nat) (grid : Grid) (body : Body)
     (dead : Bool) (loot : Loot.Context) (view : Option OriginalForestGuideArrow.Viewport := none)
-    (audio : Option OriginalTileHitEffects.Context := none) :
+    (audio : Option OriginalTileHitEffects.Context := none)
+    (shooter : OriginalPlayerArrows.Shooter := {}) :
     State × Array Drop := Id.run do
   if state.textBoundary.isSome then return (state,#[])
-  match state.projectiles[index]?.getD .empty with
+  match state.projectileAt index with
   | .stab stab =>
     if !stab.active then return (state, #[])
     if dead then
-      return ({ state with projectiles := state.projectiles.set! index (.stab { stab with active := false, timeLeft := 0 }) }, #[])
-    let (stab, npcs, hits, projectileRandom, _, text) := stab.updateFrameWithText { owner body with luck := loot.luck } state.use.direction 4
+      return (state.setProjectile index (.stab { stab with active := false, timeLeft := 0 }), #[])
+    let (stab, npcs, hits, projectileRandom, _, text) := stab.updateFrameWithText { owner body with luck := loot.luck } state.use.direction state.stabCrit
       (state.actors.map Actor.toNpc) (some grid) state.projectileRandom (onKill state loot) (onStrike state grid view)
       (state.npcText) (onStrikeSound state audio)
     let state := state.acceptNpcText text
-    return ({ state.withHits npcs hits body audio.isSome loot with
-      projectiles := state.projectiles.set! index (.stab stab)
-      projectileRandom }, dropsFromHits hits)
+    let state := (state.withHits npcs hits body audio.isSome loot).setProjectile index (.stab stab)
+    return ({ state with projectileRandom }, dropsFromHits hits)
+  -- BEGIN B-ZONE projectiles-wooden-arrow (S03)
+  | .woodenArrow arrow =>
+    -- `OriginalPlayerArrows.step` on the session's own NPC slots, dust pool and CombatText state (the
+    -- same threading as the Guide's arrow), so every kind of the one slot loop sees what earlier slots did.
+    if !arrow.active then return (state, #[])
+    let target (actor : Actor) : Option OriginalPlayerArrows.Target := (actor.arrowTarget).map fun t =>
+      { npc := t.npc, slime := t.slime, dustAlpha := t.dustAlpha, dustColor := t.dustColor }
+    let step := OriginalPlayerArrows.step {
+      grid, shooter, onKill := onKill state loot, onStrike := onStrike state grid view, text := state.npcText }
+      arrow (state.actors.map target) state.projectileRandom { state.dustPool view with enabled := view.isSome }
+    let accepted := (state.acceptNpcText step.text).setProjectile index (.woodenArrow step.arrow)
+    let state := { accepted with
+      guideDust := state.guideDust ++ step.dust
+      projectileRandom := step.random }
+    let some hit := step.hit | return (state, #[])
+    -- the strike's HitSound / DeathSound is not resolved by the arrow leaf: a client stops here
+    let soundBoundary : Option String := if audio.isSome then
+        some s!"wooden arrow strike on NPC slot {hit.slot}: its hit/death sound is not resolved" else none
+    let state := { state with projectileBoundary := state.projectileBoundary.or soundBoundary }
+    let state := state.recordNpcStrike hit.slot hit.strike.died true
+    let stop := if hit.strike.died then (lootBoundary loot (state.actors[hit.slot]?.getD .empty)).map (hit.slot, ·)
+      else none
+    let state := State.absorbGore { state with npcBoundary := state.npcBoundary.or stop } hit.gore hit.slot
+    let actor := state.actors[hit.slot]!.applyHit hit.strike.npc (localNpcTarget body dead)
+    return ({ state with
+      actors := state.actors.set! hit.slot actor
+      noSpawnCycle := state.noSpawnCycle || hit.strike.died
+      skeletronDefeated := state.skeletronDefeated || (hit.strike.died && actor.typeId.toNat == headType) }, hit.drops)
+  -- END B-ZONE projectiles-wooden-arrow
   | .guideArrow arrow =>
     if !arrow.active then return (state, #[])
     let result := OriginalForestGuideArrow.step {
       grid, onKill := onKill state loot, onStrike := onStrike state grid view,text := state.npcText 255 }
       arrow (state.actors.map Actor.arrowTarget) state.projectileRandom
       { state.dustPool view with enabled := view.isSome }
-    let state := { state.acceptNpcText result.text with
-      projectiles := state.projectiles.set! index (.guideArrow result.arrow)
+    let accepted := (state.acceptNpcText result.text).setProjectile index (.guideArrow result.arrow)
+    let state := { accepted with
       guideDust := state.guideDust ++ result.dust
       projectileRandom := result.random }
     let some hit := result.hit | return (state, #[])
@@ -1313,10 +1456,13 @@ def State.advance (state : State) (world : OriginalGreenSlime.World) (body : Bod
   combat := match advanceGorePool combat.gorePool grid combat.goreLoadedTypes with
     | .ok gorePool => { combat with gorePool }
     | .error why => { combat with npcBoundary := combat.npcBoundary.or (some (0, why)) }
-  for index in [:combat.projectiles.size] do
+  -- BEGIN B-ZONE projectiles-headless-loop (S03): Main.UpdateProjectiles, slots 0..999 ascending
+  for index in [:OriginalPlayerArrows.maxProjectiles] do
+    if !(combat.projectileAt index).active then continue
     let (next, more) := combat.advanceProjectile index grid body dead { loot with grid := loot.grid.map fun _ => grid }
     combat := next
     drops := drops ++ more
+  -- END B-ZONE projectiles-headless-loop
   return (combat, drops)
 
 end Lean4Terria.OriginalCombat

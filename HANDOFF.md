@@ -544,3 +544,40 @@ Root has delivered matching stop-after-current-attempt directives to live API wo
 - Codex：只读清点叶模块队列，输出 `.lake/root-brain/leaf-queue.md`。之后按需用 `codex exec` 承担独立的新叶模块。
 - 空闲的 Claude 会话：按队列分派新的独立叶模块（只写新文件）。
 - Claude 周额度已用 78%，5 小时窗口已用 77%。重置卡需用户本人在账户界面使用，Root 没有相应工具。
+
+### 11月20日凌晨：用户授权 Root 夜间自主推进（active）
+
+用户原话「全部动手」「我准备睡觉了，你来负责推进，不需要问我同不同意」。Root 当前执行的优化：
+1. 挂接区：A 处理 S00–S05 时标出 `B-ZONE`，之后 B 在构建锁下可以直接改挂接区内部（见 `.lake/root-brain/OWNERSHIP.md` 修订）。
+2. 共用工具包加自动复核脚本：新会话 leafkit，产出 `.lake/leafkit/` 和 `.lake/root-brain/LEAFKIT.md`。
+3. 复核改为先跑脚本、再抽查（工具包交付后启用）。
+4. 会话轮换：叶会话做满 3 个左右模块后收尾，由 Root 新开干净会话（规则见 ASSIGNMENTS.md）。
+5. iCloud：用户已关闭驱逐。占位文件正在批量取回（01:43 还剩 11,200 个），`.lake/build` 优先。取回完毕后，Root 在持有构建锁时把 `.lake` 排除出 iCloud 同步。
+6. 里程碑 M1：新建世界 → 第一周 → 克苏鲁之眼（见 `.lake/root-brain/MILESTONE-M1.md`），按 M1 路径优先派发。新会话 eye-of-cthulhu 已开工。
+- 02:56：iCloud 占位文件全部取回（`find -flags +dataless` = 0）。Root 持有 build.lock 把 `.lake` 改名为 `.lake.nosync`，原位置建符号链接 `.lake -> .lake.nosync`，此后 `.lake` 不再同步到 iCloud。`.gitignore` 加了 `/.lake` 和 `/.lake.nosync/`。
+- 已通过 Root 复核：G01 第 4 包（天气冻结 442c825f，接受附说明）；UndergroundSpawn、TravelMerchant（接受附说明）；PotionBuffs（接受）。
+
+### 11月20日：用户要求「这轮跑完先暂停吧」（收口中）
+
+Root 已通知所有会话：把已经开始的批次跑完，能 RELEASE 就交，交不了就写 WIP 检查点，然后停下，不开新任务。`.lake.nosync/forest-desktop-integration/PAUSE_REQUEST_CURRENT.json` 已改为 closing_current_round。各叶的状态见 `.lake.nosync/root-brain/ASSIGNMENTS.md`。
+
+本轮新交付（Root 尚未复核）：
+- WorldGenTerrain（TileRunner、WallFrame、Terrain，58,087 项检查一致，40/40 负控检出）；
+- RainNpcs（26/26 负控检出；雨夜生成需要修已发布的 OriginalForestSpawn，归 A）。
+
+未完成：
+- Gnome：只交了第 1 阶段（选型和默认值），AI 等其余部分未做；
+- KingSlime：在重采语料；
+- CavernEnemies：负控在跑；
+- AccessoryMovement：第三轮负控在跑；
+- HomelessNpc：补测中；
+- ZombieVariants、TownNpcAI：进行中；
+- 弓和箭的音效：已排队。
+
+LeafKit 工具包已给 5 个旧叶补齐适配器，`verify` 都能完整跑通。
+
+A 的进度：S00、S01、S02、S03、S05 已完成，S04 进行中；G02 已接 L4，愤怒骷髅问题已修复。
+
+环境：
+- `.lake` 是指向 `.lake.nosync` 的符号链接，已加 iCloud 忽略属性，看门狗 `.lake.nosync/root-brain/lake-watchdog.sh` 在后台运行。
+- 彻底的修复办法是把仓库移出 `~/Documents`，由用户决定。

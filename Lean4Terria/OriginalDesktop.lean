@@ -20,6 +20,9 @@ import Lean4Terria.OriginalPlayerFile
 import Lean4Terria.OriginalPlayerBuffBar
 import Lean4Terria.OriginalResidentText
 import Lean4Terria.OriginalSession
+-- BEGIN B-ZONE playerdraw-import (S05)
+import Lean4Terria.OriginalPlayerDrawRuntime
+-- END B-ZONE playerdraw-import
 import Lean4Terria.OriginalSkeletronPresentation
 import Lean4Terria.OriginalWorldExport
 import Lean.Data.Json
@@ -55,6 +58,11 @@ open OriginalWorld (Archive Chest Terrain)
 @[extern "terria_original_posed_sprite_region"] private opaque posedSpriteRegion (asset : @& String)
     (sourceX sourceY width height color : UInt32)
     (x y pivotX pivotY scale rotation : Float) (mirror : Bool) : IO Unit
+-- BEGIN B-ZONE playerdraw-texture-size (S05)
+/-- `(width, height)` of a texture as the native asset loader actually loaded it (`width | height << 32`,
+0 when it did not load). -/
+@[extern "terria_original_loaded_texture_size"] private opaque loadedTextureSize (asset : @& String) : IO UInt64
+-- END B-ZONE playerdraw-texture-size
 @[extern "terria_original_death_templates"] private opaque originalDeathTemplates : IO String
 @[extern "terria_original_local_death_date"] private opaque localDeathDate : IO String
 @[extern "terria_original_assembly_path"] private opaque originalAssemblyPath : IO String
@@ -154,8 +162,69 @@ private def Camera.target (camera : Camera) (x y : Nat) : Option Cell :=
     some ⟨(camera.x + (x : Int)).toNat / 16, (camera.y + (y : Int)).toNat / 16⟩
   else none
 
+-- BEGIN B-ZONE lighting-draw-light (S01)
+/-- `Lighting.GetColor` of one draw, read from the session's lighting runtime: every cell of the
+engine's `_activeProcessedArea` through `OriginalLightingRuntime.packedColor` (`0xRRGGBBAA`, the
+renderer's tint order) and `OriginalLightingRuntime.packedValue` (FNA `Color.PackedValue`, as
+`Main.DrawRain` and the water dust take it), once per draw after the draw's `LightTiles` calls (the
+active map only changes there, at phase 3 Present). Outside the area `GetColor` is the black of an
+empty cell; `outsideColor`/`outsideValue` are read through the same calls at a cell outside it. -/
+private structure DrawLight where
+  area : OriginalLightMap.Rectangle
+  colors : Array UInt32
+  values : Array UInt32
+  outsideColor : UInt32
+  outsideValue : UInt32
+
+/-- Read the active map. A `Fault` is fatal (natively an exception in `Lighting.GetColor`): it is
+thrown, never substituted. -/
+private def DrawLight.read (rt : OriginalLightingRuntime.Runtime) : IO DrawLight := do
+  let get (what : String) (x y : Int32) (r : Except OriginalLightingEngine.Fault UInt32) : IO UInt32 :=
+    match r with
+    | .ok v => pure v
+    | .error f => throw (IO.userError s!"Lighting.GetColor({x}, {y}) [{what}]: {reprStr f}")
+  let area := rt.lighting.engine.activeProcessedArea
+  -- `Rectangle.Contains` is half-open: the cell at `X + Width` is outside the area.
+  let ox := area.x + area.width
+  let outsideColor ← get "packedColor" ox area.y (OriginalLightingRuntime.packedColor rt ox area.y)
+  let outsideValue ← get "packedValue" ox area.y (OriginalLightingRuntime.packedValue rt ox area.y)
+  let w := area.width.toInt.toNat
+  let h := area.height.toInt.toNat
+  let mut colors := Array.mkEmpty (w * h)
+  let mut values := Array.mkEmpty (w * h)
+  for j in [:h] do
+    for i in [:w] do
+      let x := area.x + Int32.ofNat i
+      let y := area.y + Int32.ofNat j
+      colors := colors.push (← get "packedColor" x y (OriginalLightingRuntime.packedColor rt x y))
+      values := values.push (← get "packedValue" x y (OriginalLightingRuntime.packedValue rt x y))
+  return { area, colors, values, outsideColor, outsideValue }
+
+private def DrawLight.index? (l : DrawLight) (x y : Int) : Option Nat :=
+  let dx := x - l.area.x.toInt
+  let dy := y - l.area.y.toInt
+  if dx < 0 || dy < 0 || dx ≥ l.area.width.toInt || dy ≥ l.area.height.toInt then none
+  else some (dy.toNat * l.area.width.toInt.toNat + dx.toNat)
+
+/-- `Lighting.GetColor(x, y)` packed `0xRRGGBBAA` (`OriginalLightingRuntime.packedColor`). -/
+private def DrawLight.color (l : DrawLight) (x y : Int) : UInt32 :=
+  match l.index? x y with
+  | some k => l.colors[k]!
+  | none => l.outsideColor
+
+/-- `Lighting.GetColor(x, y)` as FNA `Color.PackedValue` (`OriginalLightingRuntime.packedValue`). -/
+private def DrawLight.value (l : DrawLight) (x y : Int) : UInt32 :=
+  match l.index? x y with
+  | some k => l.values[k]!
+  | none => l.outsideValue
+-- END B-ZONE lighting-draw-light
+
 private structure Scene where
   state : OriginalSession.State
+  -- BEGIN B-ZONE lighting-scene (S01)
+  /-- `Lighting.GetColor` of the latest draw (`DrawLight.read` after its `LightTiles` calls). -/
+  light : DrawLight
+  -- END B-ZONE lighting-scene
   /-- UI clock/cache: neither belongs to the world or player save. -/
   cursorClock : OriginalCursorItemIcon.Clock := {}
   cursorIconCache : OriginalCursorItemIcon.Cache := {}
@@ -168,8 +237,15 @@ private structure Scene where
   waterfallRenderer : OriginalDesktopWaterfall.Renderer := {}
   sky : OriginalForestSky.Sky := {}
   skyAtmosphere : Float32 := 1
+  -- BEGIN B-ZONE playerdraw-scene (S05)
+  /-- Why the latest draw of the living player fell back to the simplified route (`none`: the armor
+  layers of `OriginalPlayerDrawRuntime` drew it). Logged when it changes. -/
+  playerDrawBoundary : Option String := none
+  -- END B-ZONE playerdraw-scene
   manaDraws : Array (Nat × Array OriginalForestChatLayout.Sprite) := #[]
   spikeBallDraws : Array OriginalForestChatLayout.Sprite := #[]
+  /-- The sprites `Main.DrawRain` emitted this draw (screen positions, packed R | G<<8 | B<<16 | A<<24). -/
+  rainDraws : Array OriginalRainAtmosphere.Sprite := #[]
   waterScene : OriginalSceneWaterStyle.State := OriginalSceneWaterStyle.State.teleported
   appearance : Appearance := default
   dirtyFrames : Std.HashSet (Nat × Nat) := {}
@@ -1024,13 +1100,6 @@ private def foregroundFrame (scene : Scene) (patch : Option FramePatch)
   ((preserved.or captured).orElse fun _ => terrainFrame scene.state.terrain x y tile frameNumber)
     |>.getD (18 + 18 * frameNumber.getD (variant x y), 18)
 
-private def lightAt (terrain : Terrain) (x y : Nat) (wall : Bool) : UInt32 :=
-  let depth := y - terrain.header.surface.toUInt64.toNat
-  let shadow := if wall then 136 else if depth == 0 then 255 else max 78 (235 - depth * 6)
-  let sky : UInt32 := shadow.toUInt32
-  if ((terrain.tile? x y).getD default).fullbrightBlock then 0xffffffff
-  else (sky <<< 24) ||| (sky <<< 16) ||| (sky <<< 8) ||| 255
-
 private def skyFrame (scene : Scene) (camera : Camera) : OriginalForestNightSky.Frame :=
   let header := scene.state.terrain.header
   let previewColor : OriginalForestSky.Rgba := ⟨0x79, 0xac, 0xde, 0xff⟩
@@ -1104,7 +1173,7 @@ private def drawWalls (scene : Scene) (camera : Camera)
       let number := ((scene.state.wallFrames.get? (x, y)).map (·.number)).getD
         (OriginalWallWork.fallbackWallNumber terrain.header.id x y)
       let frame := OriginalWallWork.wallSpriteFrame terrain x y tile.wall number
-      let color := if tile.fullbrightWall then 0xffffffff else lightAt terrain x y true
+      let color := if tile.fullbrightWall then 0xffffffff else scene.light.color x y
       discard <| originalSprite s!"Wall_{tile.wall}" (dx - 8) (dy - 8) 32 32
         frame.frameX frame.frameY 32 32 (color := color)
 
@@ -1152,7 +1221,8 @@ private def drawTiles (scene : Scene) (patch : Option FramePatch) (camera : Came
         if !tile.invisibleBlock && drawTileInSolidLayer id == solidLayer then
           let (sx, sy) := foregroundFrame scene patch x y tile
           let source := s!"Tiles_{id}"
-          let color := if tile.actuated then 0xbcbcbcff else lightAt terrain x y false
+          let color := if tile.actuated then 0xbcbcbcff else if tile.fullbrightBlock then 0xffffffff
+            else scene.light.color x y
           if OriginalPlatformFraming.isPlatform id.toNat then
             let inset : Nat := if tile.shape == .halfBlock then 8 else 0
             if let some foot := OriginalPlatformFraming.stairFoot terrain x y then
@@ -1209,10 +1279,110 @@ private def drawCorpse (scene : Scene) (camera : Camera) (parts : OriginalPlayer
     draw s!"Player_Hair_{look.hair.toNat + 1}" look.hairColor parts.headPosition 20 22.4 parts.headRotation
   finally premultipliedAlpha false
 
-private def drawPlayer (scene : Scene) (camera : Camera) : IO Unit := do
+-- BEGIN B-ZONE playerdraw-armor (S05)
+/-- The loaded asset name of a layer texture (`TextureAssets`: `Images/…` without the prefix). -/
+private def armorAsset : OriginalPlayerArmorDraw.Tex → String
+  | .armorHead id => s!"Armor_Head_{id}"
+  | .armorBody id => s!"Armor_Body_{id}"
+  | .femaleBody id => s!"Female_Body_{id}"
+  | .armorBodyComposite id => s!"Armor/Armor_{id}"
+  | .armorLeg id => s!"Armor_Legs_{id}"
+  | .players skin part => s!"Player_{skin}_{part}"
+  | .playerHair id => s!"Player_Hair_{id + 1}"
+  | .playerHairAlt id => s!"Player_HairAlt_{id + 1}"
+  | .glowMask id => s!"Glow_{id}"
+  | .extra id => s!"Extra_{id}"
+
+/-- Buffs whose `UpdateBuffs` sets a player flag that `BoringSetup` IL_2a2c‥4907 turns into a visual effect
+(honey … witheredWeapon: poisoned, venom, ichor, on fire 1–3, frostburn 1–2, burned, shadowflame, slimed,
+lovestruck, stinky, withered armor/weapon, wet, sparkle slime). Declared mapping, not read from the CIL. -/
+private def visualEffectBuffs : Array Nat :=
+  #[20, 70, 69, 24, 39, 323, 44, 324, 67, 153, 197, 119, 120, 195, 196, 48, 103, 320]
+
+/-- `LegacyPlayerRenderer.DrawPlayerFull` IL_0876..08d5 for the ordinary unmounted living player: `DrawPlayer`
+at `position + netOffset + (0, gfxOffY)` with shadow 0, through `OriginalPlayerDrawRuntime.drawArmor` (leggings,
+torso, head layers in `DrawDataCache` order, lit by the session's lighting runtime). Returns `some why` (and draws
+nothing) when the leaf reports `OutOfScope` or a layer cannot be rendered faithfully here; the caller then uses the
+simplified route and records the boundary. Pose: `bodyFrame` row 0 and `legFrame` row `walking` of the window's
+existing frame animation (the rest of `PlayerFrame` is not in the leaf). Declared: `eyeFrameToShow` 0 (no blink),
+`immuneAlpha` 0 (the immune blink is not tracked; reported as a boundary while it would blink), no hair/skin dye. -/
+private def drawArmorLayers (scene : Scene) (camera : Camera) (walking : Nat) : IO (Option String) := do
+  let state := scene.state
+  let body := state.player.body
+  let health := state.health
+  let live (id : Nat) := (health.buffType.zip health.buffTime).any fun (b, t) => b == id && t > 0
+  let equipment := state.equipment
+  -- inputs this window does not know: refuse instead of drawing them wrongly
+  if (equipment.dye.extract 0 3).any (·.item != 0) then return some "armor dye (shader) equipped"
+  if ((List.range 20).filter (fun i => (3 ≤ i && i ≤ 9) || 13 ≤ i)).any (fun i => (equipment.armor[i]?.map (·.item)).getD 0 != 0) then
+    return some "accessory equipped (its draw slots are not mapped)"
+  if live 156 then return some "stoned (DrawPlayerStoned)"
+  if live 353 then return some "shimmering (shimmerTransparency)"
+  if live 10 then return none  -- Invisibility: DrawPlayerFull IL_08b2 skips DrawPlayer
+  let look := scene.appearance
+  let color (rgba : UInt32) : OriginalPlayerArmorDraw.Color :=
+    ⟨(rgba >>> 24).toUInt8, (rgba >>> 16).toUInt8, (rgba >>> 8).toUInt8, rgba.toUInt8⟩
+  let held := ((state.equipped scene.selected).map (·.item.toNat)).getD 0
+  let player : OriginalPlayerArmorDraw.Player := {
+    position := ⟨body.position.x, body.position.y⟩, width := Int32.ofNat body.width, height := Int32.ofNat body.height
+    direction := if state.player.direction < 0 then -1 else 1, gravDir := 1
+    skinVariant := Int32.ofNat look.skinVariant.toNat, hair := Int32.ofNat look.hair.toNat
+    bodyFrame := ⟨0, 0, 40, 56⟩, legFrame := ⟨0, Int32.ofNat (walking * 56), 40, 56⟩
+    hairColor := color look.hairColor, skinColor := color look.skinColor, eyeColor := color look.eyeColor
+    shirtColor := color look.shirtColor, underShirtColor := color look.underShirtColor
+    pantsColor := color look.pantsColor, shoeColor := color look.shoeColor
+    heldItemType := Int32.ofNat held
+    effectFlags := visualEffectBuffs.toList.map fun id => (s!"buff {id}", live id) }
+  -- `TextureAssets.Players[skin, 15]` as actually loaded
+  let eyelidName := s!"Player_{look.skinVariant}_15"
+  let eyelidSize ← loadedTextureSize eyelidName
+  let eyelid : Int32 → Option (Int32 × Int32) := fun skin =>
+    if skin == player.skinVariant && eyelidSize != 0 then
+      some (Int32.ofNat (eyelidSize &&& 0xffffffff).toNat, Int32.ofNat (eyelidSize >>> 32).toNat)
+    else none
+  let context := OriginalPlayerDrawRuntime.context state.lighting
+    ⟨OriginalCollision.single camera.x, OriginalCollision.single camera.y⟩ eyelid
+  let drawPosition : OriginalPlayerArmorDraw.Vector2 := ⟨body.position.x, body.position.y + body.gfxOffY⟩
+  let result ← match OriginalPlayerDrawRuntime.drawArmor context equipment player drawPosition 0 with
+    | .ok r => pure r
+    | .error why => return some s!"OutOfScope {reprStr why}"
+  let layers := result.leggings ++ result.torso ++ result.head
+  -- validate every layer before drawing any of them
+  let mut plan : Array (String × OriginalPlayerArmorDraw.Rect × OriginalPlayerArmorDraw.DrawData) := #[]
+  for d in layers do
+    let some src := d.sourceRect | return some s!"layer {reprStr d.texture} without a source rectangle"
+    if src.x < 0 || src.y < 0 || src.w ≤ 0 || src.h ≤ 0 then return some s!"layer {reprStr d.texture}: source {reprStr src}"
+    if d.effect &&& 2 != 0 then return some "vertical flip (gravity)"
+    let hairLayer := match d.texture with | .playerHair _ | .playerHairAlt _ => true | _ => false
+    -- 1000/1001: the hair shader packing of an undyed player (PackShader(0 or 1, HairShader))
+    if d.shader != 0 && !(hairLayer && (d.shader == 1000 || d.shader == 1001)) then
+      return some s!"layer {reprStr d.texture}: shader {d.shader}"
+    let asset := armorAsset d.texture
+    let size ← loadedTextureSize asset
+    if size == 0 then return some s!"texture {asset} not loaded"
+    let (tw, th) := ((size &&& 0xffffffff).toNat, (size >>> 32).toNat)
+    if src.x.toInt.toNat + src.w.toInt.toNat > tw || src.y.toInt.toNat + src.h.toInt.toNat > th then
+      return some s!"layer {asset}: source {reprStr src} outside {tw}×{th}"
+    plan := plan.push (asset, src, d)
+  premultipliedAlpha true
+  try
+    for (asset, src, d) in plan do
+      let c := d.color
+      let rgba := (c.r.toUInt32 <<< 24) ||| (c.g.toUInt32 <<< 16) ||| (c.b.toUInt32 <<< 8) ||| c.a.toUInt32
+      posedSpriteRegion asset src.x.toInt.toNat.toUInt32 src.y.toInt.toNat.toUInt32
+        src.w.toInt.toNat.toUInt32 src.h.toInt.toNat.toUInt32 rgba
+        d.position.x.toFloat d.position.y.toFloat d.origin.x.toFloat d.origin.y.toFloat
+        d.scale.toFloat d.rotation.toFloat (d.effect &&& 1 != 0)
+  finally premultipliedAlpha false
+  -- drawn; the immune blink is the one declared input that is visibly off
+  if health.immune && !health.immuneNoBlink then return some "drawn with immuneAlpha 0 (immune blink not tracked)"
+  return none
+-- END B-ZONE playerdraw-armor
+
+private def drawPlayer (scene : Scene) (camera : Camera) : IO (Option String) := do
   if scene.state.health.dead then
     if let some parts := scene.state.corpseParts then drawCorpse scene camera parts
-    return
+    return none
   let player := scene.state.player
   let body := player.body
   let x := body.position.x.toInt32.toInt - camera.x - 10
@@ -1225,15 +1395,20 @@ private def drawPlayer (scene : Scene) (camera : Camera) : IO Unit := do
   let look := scene.appearance
   let part (index sy : Nat) (color : UInt32) :=
     layer s!"Player_{look.skinVariant}_{index}" sy color
-  part 0 0 look.skinColor
-  part 1 0 0xfff8e4ff
-  part 2 0 look.eyeColor
-  layer s!"Player_Hair_{look.hair.toNat + 1}" 0 look.hairColor
-  part 3 0 look.skinColor
-  part 4 0 look.underShirtColor
-  part 6 0 look.shirtColor
-  part 11 (walking * 56) look.pantsColor
-  part 12 (walking * 56) look.shoeColor
+  -- BEGIN B-ZONE playerdraw-route (S05): the armor layers, else the simplified route with the boundary
+  let boundary ← drawArmorLayers scene camera walking
+  let drawnByLayers := boundary.isNone || (boundary.any (·.startsWith "drawn with"))
+  if !drawnByLayers then
+    part 0 0 look.skinColor
+    part 1 0 0xfff8e4ff
+    part 2 0 look.eyeColor
+    layer s!"Player_Hair_{look.hair.toNat + 1}" 0 look.hairColor
+    part 3 0 look.skinColor
+    part 4 0 look.underShirtColor
+    part 6 0 look.shirtColor
+    part 11 (walking * 56) look.pantsColor
+    part 12 (walking * 56) look.shoeColor
+  -- END B-ZONE playerdraw-route
   let animation := scene.state.itemUse.itemAnimation
   let item := (scene.state.equipped scene.selected).map (·.item)
   if animation > 0 then
@@ -1243,7 +1418,7 @@ private def drawPlayer (scene : Scene) (camera : Camera) : IO Unit := do
       let sy := (use.itemLocation.y + body.gfxOffY).toInt32.toInt - camera.y
       posedSprite "Item_24" 0 32 32 0xffffffff sx.toFloat sy.toFloat (if left then 32 else 0) 32
         1 use.itemRotation.toFloat left
-      return
+      return boundary
     if let some id := item then
       if id == copperPickaxe || id == copperAxe || (OriginalWallWork.Tables.hammerStats id).isSome then
         let degreesPerTick := if id == copperAxe then 6.0 else 7.8
@@ -1257,6 +1432,7 @@ private def drawPlayer (scene : Scene) (camera : Camera) : IO Unit := do
           (OriginalWallWork.Tables.wallItem id).isSome then
         discard <| originalSprite s!"Item_{id}" (if left then x - 2 else x + 24) (y + 26) 14 14
             (fit := true) (mirror := left)
+  return boundary
 
 private def drawSlimes (scene : Scene) (camera : Camera) : IO Unit := do
   for slime in scene.state.combat.slimes do
@@ -1264,8 +1440,8 @@ private def drawSlimes (scene : Scene) (camera : Camera) : IO Unit := do
     let x := slime.position.x.toFloat + (slime.width / 2).toFloat - camera.x.toFloat
     let y := slime.position.y.toFloat + slime.height.toFloat + slime.gfxOffY.toFloat - camera.y.toFloat
     if x < -32 || x ≥ screenWidth.toFloat + 32 || y < 0 || y ≥ screenHeight.toFloat + 26 then continue
-    let light := lightAt scene.state.terrain (slime.position.x / 16).toUInt32.toNat
-      (slime.position.y / 16).toUInt32.toNat false
+    let light := scene.light.color (slime.position.x / 16).toUInt32.toNat
+      (slime.position.y / 16).toUInt32.toNat
     let base := (light &&& 0xffffff00) ||| (255 - slime.alpha).toUInt32
     let colored := slime.color.rgba
     let sy := slime.frameY.toNat.toUInt32
@@ -1280,8 +1456,8 @@ private def drawGhosts (scene : Scene) (camera : Camera) : IO Unit := do
     let x := ghost.position.x.toFloat + (ghost.width / 2).toFloat - camera.x.toFloat
     let y := ghost.position.y.toFloat + ghost.height.toFloat + ghost.gfxOffY.toFloat - camera.y.toFloat
     if x < -56 || x ≥ screenWidth.toFloat + 56 || y < -56 || y ≥ screenHeight.toFloat + 56 then continue
-    let light := lightAt scene.state.terrain (ghost.position.x / 16).toUInt32.toNat
-      (ghost.position.y / 16).toUInt32.toNat false
+    let light := scene.light.color (ghost.position.x / 16).toUInt32.toNat
+      (ghost.position.y / 16).toUInt32.toNat
     let tint := (light &&& 0xffffff00) ||| (255 - ghost.alpha).toUInt32
     let (_, sy, width, height) := ghost.textureFrame
     posedSprite "NPC_316" sy.toUInt32 width.toUInt32 height.toUInt32 tint x y
@@ -1296,7 +1472,7 @@ private def drawResidents (scene : Scene) (camera : Camera) : IO Unit := do
     let x := center.x.toFloat - camera.x.toFloat
     let y := n.position.y.toFloat + n.height.toFloat + n.gfxOffY.toFloat - camera.y.toFloat
     if x < -42 || x ≥ screenWidth.toFloat + 42 || y < -34 || y ≥ screenHeight.toFloat + 34 then continue
-    let tint := lightAt scene.state.terrain (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat false
+    let tint := scene.light.color (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat
     posedSprite "NPC_123" 0 42 34 tint x y 21 34 n.scale.toFloat 0 (n.spriteDirection == 1)
   for resident in scene.state.combat.residents do
     if !resident.active then continue
@@ -1304,7 +1480,7 @@ private def drawResidents (scene : Scene) (camera : Camera) : IO Unit := do
     let x := center.x.toFloat - camera.x.toFloat
     let y := resident.position.y.toFloat + resident.height.toFloat + resident.gfxOffY.toFloat - camera.y.toFloat
     if x < -56 || x ≥ screenWidth.toFloat + 56 || y < -56 || y ≥ screenHeight.toFloat + 56 then continue
-    let tint := lightAt scene.state.terrain (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat false
+    let tint := scene.light.color (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat
     let (_, sy, width, height) := resident.textureFrame
     posedSprite resident.kind.textureName sy.toUInt32 width.toUInt32 height.toUInt32 tint x y
       (width / 2).toFloat height.toFloat 1 0 (resident.spriteDirection == 1)
@@ -1318,7 +1494,7 @@ private def drawAngryBones (scene : Scene) (camera : Camera) : IO Unit := do
     let x := center.x.toFloat - camera.x.toFloat
     let y := n.position.y.toFloat + n.height.toFloat + n.gfxOffY.toFloat - camera.y.toFloat
     if x < -56 || x ≥ screenWidth.toFloat + 56 || y < -56 || y ≥ screenHeight.toFloat + 56 then continue
-    let tint := lightAt scene.state.terrain (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat false
+    let tint := scene.light.color (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat
     posedSprite s!"NPC_{enemy.npcType}" (n.frameY * 56).toNat.toUInt32 40 56 tint x y
       20 56 n.scale.toFloat n.rotation.toFloat (n.spriteDirection == 1)
 
@@ -1330,7 +1506,7 @@ private def drawDarkCasters (scene : Scene) (camera : Camera) : IO Unit := do
     if !n.active || enemy.kind == .waterSphere then continue
     let center := n.center
     let sprite := OriginalDarkCaster.npcSprite enemy camera.skyView.unscaledPosition 40 56
-      (lightAt scene.state.terrain (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat false)
+      (scene.light.color (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat)
     let x := sprite.position.x.toFloat
     let y := sprite.position.y.toFloat
     if x < -40 || x ≥ screenWidth.toFloat + 40 || y < -56 || y ≥ screenHeight.toFloat + 56 then continue
@@ -1345,7 +1521,7 @@ private def drawDungeonSlimes (scene : Scene) (camera : Camera) : IO Unit := do
     let x := center.x.toFloat - camera.x.toFloat
     let y := center.y.toFloat - camera.y.toFloat
     if x < -44 || x ≥ screenWidth.toFloat + 44 || y < -68 || y ≥ screenHeight.toFloat + 68 then continue
-    let tint := lightAt scene.state.terrain (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat false
+    let tint := scene.light.color (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat
     let channel (shift : UInt32) := ((tint >>> shift) &&& 255).toNat
     let light : OriginalGreenSlime.Color := ⟨channel 24, channel 16, channel 8, channel 0⟩
     let key := OriginalDungeonSlime.keySprite slime camera.skyView.unscaledPosition
@@ -1388,7 +1564,7 @@ private def drawSkeletron (scene : Scene) (camera : Camera) : IO Unit := do
     let center := OriginalSkeletron.Part.center part
     let x := center.x.toFloat - camera.x.toFloat
     let y := center.y.toFloat - camera.y.toFloat
-    let tint := lightAt scene.state.terrain (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat false
+    let tint := scene.light.color (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat
     if part.typeId == 35 then
       posedSprite "NPC_35" 0 114 132 tint x y 57 77 1 part.rotation.toFloat false
     else if part.typeId == OriginalSkeletron.guardianType then
@@ -1429,7 +1605,7 @@ private def drawBunnies (scene : Scene) (camera : Camera) : IO Unit := do
     let x := center.x.toFloat - camera.x.toFloat
     let y := bunny.position.y.toFloat + bunny.height.toFloat + bunny.gfxOffY.toFloat - camera.y.toFloat
     if x < -48 || x ≥ screenWidth.toFloat + 48 || y < -40 || y ≥ screenHeight.toFloat + 40 then continue
-    let tint := lightAt scene.state.terrain (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat false
+    let tint := scene.light.color (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat
     posedSprite "NPC_46" bunny.frameY.toNat.toUInt32 48 40 tint x y 24 40 1 0 (bunny.spriteDirection == 1)
 
 private def drawBirds (scene : Scene) (camera : Camera) : IO Unit := do
@@ -1440,7 +1616,7 @@ private def drawBirds (scene : Scene) (camera : Camera) : IO Unit := do
     let x := cx - camera.x.toFloat
     let y := cy + (bird.height / 2).toFloat + bird.gfxOffY.toFloat - camera.y.toFloat
     if x < -30 || x ≥ screenWidth.toFloat + 30 || y < -24 || y ≥ screenHeight.toFloat + 24 then continue
-    let tint := lightAt scene.state.terrain (cx / 16).toUInt64.toNat (cy / 16).toUInt64.toNat false
+    let tint := scene.light.color (cx / 16).toUInt64.toNat (cy / 16).toUInt64.toNat
     let (_, sy, width, height) := bird.textureFrame
     posedSprite bird.kind.textureName sy.toUInt32 width.toUInt32 height.toUInt32 tint x y
       (width / 2).toFloat height.toFloat 1 bird.rotation.toFloat (bird.spriteDirection == 1)
@@ -1453,12 +1629,12 @@ private def drawSnails (scene : Scene) (camera : Camera) : IO Unit := do
     let y := snail.position.y + OriginalCollision.single snail.height - OriginalCollision.single camera.y
       + ((-120 : Float32) * snail.scale / 6 + 4 + 10 * snail.scale + snail.gfxOffY)
     if x < -30 || x > screenWidth.toFloat32 + 30 || y < -20 || y > screenHeight.toFloat32 + 20 then continue
-    let tint := lightAt scene.state.terrain (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat false
+    let tint := scene.light.color (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat
     posedSprite "NPC_359" snail.frameY.toNat.toUInt32 30 20 tint x.toFloat y.toFloat
       15 10 snail.scale.toFloat snail.rotation.toFloat (snail.spriteDirection == 1)
 
 private def drawStab (scene : Scene) (camera : Camera) : IO Unit := do
-  for slot in scene.state.combat.projectiles do
+  for slot in scene.state.combat.projectileList do
     let .stab stab := slot | continue
     if !stab.active then continue
     let center := stab.center
@@ -1470,14 +1646,22 @@ private def drawStab (scene : Scene) (camera : Camera) : IO Unit := do
       (stab.spriteDirection == -1)
 
 private def drawGuideArrows (scene : Scene) (camera : Camera) : IO Unit := do
-  for slot in scene.state.combat.projectiles do
-    let .guideArrow arrow := slot | continue
+  for slot in scene.state.combat.projectileList do
+    -- BEGIN B-ZONE projectiles-draw (S03): the player's Wooden Arrows are the same type-1 projectile
+    -- (`DrawProjDirect` geometry of `Projectile_1`) as the Guide's
+    let arrow : OriginalForestGuideArrow.Arrow ← match slot with
+      | .guideArrow arrow => pure arrow
+      | .woodenArrow a =>
+        pure { position := a.position, velocity := a.velocity, owner := a.owner, damage := a.damage
+               knockback := a.knockback, rotation := a.rotation, active := a.active }
+      | _ => continue
+    -- END B-ZONE projectiles-draw
     let some draw := OriginalForestGuideArrow.draw arrow camera.skyView.unscaledPosition | continue
     let x := draw.position.x.toFloat
     let y := draw.position.y.toFloat
     if x < -32 || x > screenWidth.toFloat + 32 || y < -32 || y > screenHeight.toFloat + 32 then continue
-    let tint := lightAt scene.state.terrain
-      ((arrow.position.x + 5) / 16).toUInt32.toNat ((arrow.position.y + 5) / 16).toUInt32.toNat false
+    let tint := scene.light.color
+      ((arrow.position.x + 5) / 16).toUInt32.toNat ((arrow.position.y + 5) / 16).toUInt32.toNat
     posedSpriteRegion "Projectile_1" draw.source.x.toNat.toUInt32 draw.source.y.toNat.toUInt32
       draw.source.w.toNat.toUInt32 draw.source.h.toNat.toUInt32 tint x y draw.origin.x.toFloat draw.origin.y.toFloat
       draw.scale.x.toFloat draw.rotation.toFloat draw.flipX
@@ -1500,8 +1684,8 @@ private def Scene.prepareManaDust (scene : Scene) (camera : Camera) : Scene := I
       manaRefillDust := manaRefillDust.push p
       continue
     let position := p.dust.position
-    let light := lightAt scene.state.terrain
-      ((position.x.toFloat + 4).toUInt64.toNat / 16) ((position.y.toFloat + 4).toUInt64.toNat / 16) false
+    let light := scene.light.color
+      ((position.x.toFloat + 4).toUInt64.toNat / 16) ((position.y.toFloat + 4).toUInt64.toNat / 16)
     let drawn := p.draw view light
     if !drawn.sprites.isEmpty then manaDraws := manaDraws.push (p.dust.slot,drawn.sprites)
     if drawn.particle.active then
@@ -1512,7 +1696,7 @@ private def Scene.prepareSpikeBalls (scene : Scene) (camera : Camera) : Scene :=
   let mut actors := scene.state.combat.actors
   let mut sprites := #[]
   let lighting := fun (x y : Int) =>
-    let tint := lightAt scene.state.terrain x.toNat y.toNat false
+    let tint := scene.light.color x y
     (⟨(tint >>> 24).toNat,((tint >>> 16) &&& 255).toNat,
       ((tint >>> 8) &&& 255).toNat,(tint &&& 255).toNat⟩ : OriginalGreenSlime.Color)
   let screen := camera.skyView.unscaledPosition
@@ -1538,6 +1722,21 @@ private def drawGuideDust (scene : Scene) (camera : Camera) : IO Scene := do
   let view : OriginalForestGuideArrow.Viewport :=
     ⟨camera.skyView.unscaledPosition,screenWidth,screenHeight⟩
   let mut guideDust := #[]
+  -- The water dust cohort (rain splashes): Main.DrawDust's per-slot body (camera cull, lit sprite and
+  -- overlay, black-light removal). Its sprites go before the other cohorts' (draw order only).
+  let mut water := scene.state.combat.waterDust
+  let waterContext : OriginalWaterDust.DrawContext := {
+    screenPosition := camera.skyView.unscaledPosition, screenWidth := screenWidth, screenHeight := screenHeight }
+  -- `Lighting.GetColor` as FNA `Color.PackedValue` (`OriginalLightingRuntime.packedValue`)
+  let packedLight := fun (x y : Int) => scene.light.value x y
+  for i in [:water.size] do
+    let some o := water[i]? | continue
+    if !o.dust.active || o.slot ≥ scene.state.combat.dustDrawBudget then continue
+    match OriginalWaterDust.drawOne waterContext packedLight o.dust with
+    | .ok (dust, sprites) =>
+      water := water.set! i { o with dust }
+      OriginalDesktopDialogue.drawSprites sprites
+    | .error why => throw (IO.userError s!"Main.DrawDust (water): {why}")
   let slots := (scene.state.combat.guideDust.mapIdx fun i p => (p.slot,false,i)) ++
     (scene.manaDraws.mapIdx fun i p => (p.1,true,i))
   for (_,mana,index) in slots.qsort (fun a b => a.1 < b.1) do
@@ -1555,9 +1754,8 @@ private def drawGuideDust (scene : Scene) (camera : Camera) : IO Scene := do
         else if OriginalForestGuideArrow.supportsBasicGround dust.request.typeId then OriginalBasicDustDraw.drawParticles
         else OriginalBloodDust.drawParticles
       let drawn := render #[dust] scene.state.combat.dustDrawBudget view fun x y =>
-        -- lightAt is still the existing depth approximation, not original
-        -- Lighting propagation; keep that boundary distinct from DrawDust.
-        lightAt scene.state.terrain x.toNat y.toNat false
+        -- `Lighting.GetColor` of this draw (`OriginalLightingRuntime.packedColor`)
+        scene.light.color x y
       OriginalDesktopDialogue.drawSprites drawn.sprites
       guideDust := guideDust ++ drawn.particles
       continue
@@ -1565,8 +1763,8 @@ private def drawGuideDust (scene : Scene) (camera : Camera) : IO Scene := do
     let x := dust.position.x.toFloat - camera.x.toFloat
     let y := dust.position.y.toFloat - camera.y.toFloat
     if x < -8 || x > screenWidth.toFloat + 8 || y < -8 || y > screenHeight.toFloat + 8 then continue
-    let light := lightAt scene.state.terrain ((dust.position.x.toFloat + 4).toUInt64.toNat / 16)
-      ((dust.position.y.toFloat + 4).toUInt64.toNat / 16) false
+    let light := scene.light.color ((dust.position.x.toFloat + 4).toUInt64.toNat / 16)
+      ((dust.position.y.toFloat + 4).toUInt64.toNat / 16)
     let typeId := dust.request.typeId
     -- Main.DrawDust lights types 6, 15 and 59..64 with Color.White before Dust.GetAlpha. The
     -- GetAlpha colours are premultiplied, as the original's AlphaBlend sprite batch expects.
@@ -1586,10 +1784,20 @@ private def drawGuideDust (scene : Scene) (camera : Camera) : IO Scene := do
     else
       draw base
       if overlay != 0 then draw overlay
-  return { scene with state := { scene.state with combat := { scene.state.combat with guideDust } } }
+  let combat := { scene.state.combat with guideDust, waterDust := water.filter (·.dust.active) }
+  return { scene with state := { scene.state with combat } }
+
+/-- `Main.DrawRain`'s sprites: `Images/Rain` crop (type * 4, 0, 2, 40), origin zero. -/
+private def drawRainSprites (scene : Scene) : IO Unit := do
+  for sprite in scene.rainDraws do
+    let c := sprite.color
+    let rgba := ((c &&& 255) <<< 24) ||| (((c >>> 8) &&& 255) <<< 16) ||| (((c >>> 16) &&& 255) <<< 8) ||| (c >>> 24)
+    posedSpriteRegion "Rain" sprite.frameX.toNat.toUInt32 sprite.frameY.toNat.toUInt32 sprite.width.toNat.toUInt32
+      sprite.height.toNat.toUInt32 rgba sprite.position.x.toFloat sprite.position.y.toFloat
+      sprite.origin.x.toFloat sprite.origin.y.toFloat sprite.scale.toFloat sprite.rotation.toFloat false
 
 private def drawGravestones (scene : Scene) (camera : Camera) : IO Unit := do
-  for slot in scene.state.combat.projectiles do
+  for slot in scene.state.combat.projectileList do
     let .gravestone grave := slot | continue
     if grave.timeLeft == 0 then continue
     let x := grave.position.x.toFloat + 12 - camera.x.toFloat
@@ -1599,8 +1807,8 @@ private def drawGravestones (scene : Scene) (camera : Camera) : IO Unit := do
       | 43 | 528 => (26, 30)
       | 531 => (28, 32)
       | _ => (32, 32)
-    let tint := lightAt scene.state.terrain (grave.position.x / 16).toUInt32.toNat
-      (grave.position.y / 16).toUInt32.toNat false
+    let tint := scene.light.color (grave.position.x / 16).toUInt32.toNat
+      (grave.position.y / 16).toUInt32.toNat
     posedSprite s!"Projectile_{grave.projectileType}" 0 width height tint x y
       (width.toNat.toFloat / 2) (height.toNat.toFloat / 2) 1 grave.rotation.toFloat false
 
@@ -1855,7 +2063,7 @@ private def drawOldShakingChests (scene : Scene) (camera : Camera) : IO Unit := 
     let some enemy := actor.oldShakingChest? | continue
     if !enemy.body.active then continue
     let center := enemy.toCombatNpc.center
-    let tint := lightAt scene.state.terrain (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat false
+    let tint := scene.light.color (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat
     let light : OriginalGreenSlime.Color :=
       ⟨(tint >>> 24).toNat,((tint >>> 16) &&& 255).toNat,((tint >>> 8) &&& 255).toNat,(tint &&& 255).toNat⟩
     let pose := OriginalOldSlime.npcSprite enemy camera.skyView.unscaledPosition light
@@ -1874,7 +2082,7 @@ private def drawNightEnemies (scene : Scene) (camera : Camera) : IO Unit := do
     let some enemy := actor.nightEnemy? | continue
     if !enemy.body.active then continue
     let center := enemy.toCombatNpc.center
-    let rgba := lightAt scene.state.terrain (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat false
+    let rgba := scene.light.color (center.x / 16).toUInt32.toNat (center.y / 16).toUInt32.toNat
     let light : OriginalForestChatLayout.Color :=
       ⟨(rgba >>> 24).toNat,((rgba >>> 16) &&& 255).toNat,((rgba >>> 8) &&& 255).toNat,(rgba &&& 255).toNat⟩
     sprites := sprites.push (← IO.ofExcept (OriginalNightEnemies.npcSprite enemy view light))
@@ -1887,7 +2095,7 @@ private def drawGores (scene : Scene) (camera : Camera) : IO Unit := do
     let some (w,h) := OriginalCombat.goreTextureSize p.typeId | continue
     let x := ((p.position.x.toFloat + w.toFloat * 0.5) / 16).toUInt64.toNat
     let y := ((p.position.y.toFloat + h.toFloat * 0.5) / 16).toUInt64.toNat
-    let rgba := lightAt scene.state.terrain x y false
+    let rgba := scene.light.color x y
     let light : OriginalForestChatLayout.Color :=
       ⟨(rgba >>> 24).toNat,((rgba >>> 16) &&& 255).toNat,((rgba >>> 8) &&& 255).toNat,(rgba &&& 255).toNat⟩
     let sprite ← IO.ofExcept (OriginalCombat.goreSprite p view light)
@@ -1911,9 +2119,10 @@ private def draw (scene : Scene) (patch : Option FramePatch) (camera : Camera)
   drawTiles scene patch camera false left right top bottom
   OriginalDesktopWaterfall.draw camera.viewport waterfalls time
   scene.liquidRenderer.drawBelowSolids camera.viewport scene.state.terrain
-    (fun x y => lightAt scene.state.terrain x y false)
+    (fun x y => scene.light.color x y)
   drawTiles scene patch camera true left right top bottom
-  for hit in scene.state.miningHits.entries do
+  -- BEGIN B-ZONE actions-hit-cracks (S02): the tile entries of the shared `Player.hitTile`
+  for hit in (OriginalSession.hitCacheOf scene.state.hits).entries do
     let (x, y) := camera.tile hit.cell.x hit.cell.y
     if x ≥ -16 && x < screenWidth && y ≥ -16 && y < screenHeight && hit.damage > 0 then
       discard <| originalSprite "TileCracks" x y 16 16 (min 3 (hit.damage / 25) * 18) 18 16 16
@@ -1921,6 +2130,7 @@ private def draw (scene : Scene) (patch : Option FramePatch) (camera : Camera)
     let (x, y) := camera.tile hit.cell.x hit.cell.y
     if x ≥ -16 && x < screenWidth && y ≥ -16 && y < screenHeight && hit.damage > 0 then
       discard <| originalSprite "TileCracks" x y 16 16 (min 3 (hit.damage / 25) * 18) 18 16 16
+  -- END B-ZONE actions-hit-cracks
   for item in scene.state.worldItems do
     let some drop := item | continue
     let x := drop.position.x.toInt32.toInt - camera.x
@@ -1941,13 +2151,19 @@ private def draw (scene : Scene) (patch : Option FramePatch) (camera : Camera)
   drawBunnies scene camera
   drawBirds scene camera
   drawSnails scene camera
-  drawPlayer scene camera
+  -- BEGIN B-ZONE playerdraw-call (S05)
+  let playerBoundary ← drawPlayer scene camera
+  if playerBoundary != scene.playerDrawBoundary then
+    if let some why := playerBoundary then IO.eprintln s!"player draw boundary: {why}"
+  let scene := { scene with playerDrawBoundary := playerBoundary }
+  -- END B-ZONE playerdraw-call
   drawStab scene camera
   drawGuideArrows scene camera
   drawGravestones scene camera
   scene.liquidRenderer.composite camera.viewport true
   drawGores scene camera
   let scene ← drawGuideDust scene camera
+  drawRainSprites scene
   drawResidentEmotes scene camera
   if let some fonts := scene.state.combat.textFonts then
     let sprites ← IO.ofExcept ((OriginalCombatText.draw scene.state.combat.texts fonts {
@@ -2076,6 +2292,7 @@ private def runLoop (initial : OriginalSession.State) (patch : Option FramePatch
     (fun dirty (x, y) => markFrameNeighbors dirty x y) {}
   let mut scene : Scene := {
     state := initial
+    light := ← DrawLight.read initial.lighting
     dirtyFrames
     appearance := (player.map (·.appearance)).getD default
   }
@@ -2245,8 +2462,14 @@ private def runLoop (initial : OriginalSession.State) (patch : Option FramePatch
         heldItemFrame := fun item => heldItemFrames.getD item ⟨0, 0⟩
         camera := some {
           position := (OriginalCollision.single camera.x, OriginalCollision.single camera.y)
-          size := (screenWidth.toFloat32, screenHeight.toFloat32), skyblockLowTiles } }
-      let windGuidHash ← if !scene.state.terrain.header.raining && scene.state.forest.any (·.needsWindHash) then
+          size := (screenWidth.toFloat32, screenHeight.toFloat32), skyblockLowTiles }
+        -- BEGIN B-ZONE actions-desktop-keys (S02)
+        -- QuickHeal / QuickMana (default keys H / B; the bridge reports their presses as bits 22 / 23).
+        -- The resolved potion sounds (`quickSounds`, Item2/Item3) are submitted after the update.
+        controlQuickHeal := pressed playKeys 22, controlQuickMana := pressed playKeys 23
+        -- END B-ZONE actions-desktop-keys
+        }
+      let windGuidHash ← if scene.state.forest.any (·.needsWindHash) then
           some <$> windHash else pure none
       scene := scene.step actionKeys target splashReady mouse {
         controlThrow := pressed playKeys 21
@@ -2256,6 +2479,11 @@ private def runLoop (initial : OriginalSession.State) (patch : Option FramePatch
         mouseInterface } windGuidHash client
       if scene.state.selectionMenuTick then sound menuTickSound
       if scene.state.manaRefillSound then playManaRefillSound
+      -- BEGIN B-ZONE actions-quick-sounds (S02): QuickHeal / QuickMana use sounds (Item_2 / Item_3)
+      for played in scene.state.quickSounds do
+        playTileHitSound played.request.typeId.toUInt32 played.request.style.toUInt32
+          played.variation.toUInt32 played.volume played.pan played.pitch
+      -- END B-ZONE actions-quick-sounds
       for played in scene.state.pickupSounds ++ (scene.state.tileHitEffects.map (·.resolvedSounds)).getD #[] do
         playTileHitSound played.request.typeId.toUInt32 played.request.style.toUInt32
           played.variation.toUInt32 played.volume played.pan played.pitch
@@ -2389,17 +2617,53 @@ private def runLoop (initial : OriginalSession.State) (patch : Option FramePatch
     let sceneCamera : OriginalSession.SceneCamera := {
       position := (OriginalCollision.single camera.x, OriginalCollision.single camera.y)
       size := (screenWidth.toFloat32, screenHeight.toFloat32), skyblockLowTiles }
-    scene := { scene with state := scene.state.drawLighting sceneCamera, blackFade := false }
+    -- BEGIN B-ZONE lighting-draw-globals (S01)
+    -- `SetBackColor`'s ColorOfTheSkies of this draw (read before the lighting: `skyFrame` reads only the
+    -- clock, the header and the previous draw's atmosphere, none of which the draw's earlier slices change).
+    -- BOUNDARY: while raining / eclipse / blood moon `skyFrame` is the preview colour, not the original's.
+    let sky := skyFrame scene camera
+    let skyColor := sky.lighting.beforeAtmosphere
+    let lightingDraw : OriginalSession.LightingDraw := {
+      -- DoDraw IL_0735 `ApplyColorOfTheSkiesToTiles` (SetBackColor, before UpdateAtmosphereTransparency)
+      tileColor := OriginalLightingRuntime.tileColorOfSkies skyColor.r.toUInt8 skyColor.g.toUInt8 skyColor.b.toUInt8
+      -- Main.mouseTextColor / DiscoR,G,B as the update clocks of the waterfall renderer advance them
+      mouseTextColor := scene.waterfallRenderer.mouseTextColor.toNat.toUInt8
+      discoR := Int32.ofInt scene.waterfallRenderer.disco[0]!
+      discoG := Int32.ofInt scene.waterfallRenderer.disco[1]!
+      discoB := Int32.ofInt scene.waterfallRenderer.disco[2]!
+      -- DoUpdate IL_0066..0087 of the latest update (the same ticks the item icons take)
+      globalTimeWrappedHourly := OriginalItemIcon.globalTimeOfTicks gameTimeTicks
+      -- Main.liquidAlpha as the previous draw's fade (`fadeLiquidAlpha` in prepareTargets) left it
+      liquidAlpha := scene.liquidRenderer.alpha
+      -- Main.waterStyle of the previous draw: this draw's water style is computed after its lighting
+      waterStyle := Int32.ofNat scene.waterScene.waterStyle
+      -- the renderer's framing of tiles whose frames the world file does not store
+      frameOf := fun x y tile => some (let (fx, fy) := foregroundFrame scene patch x y tile; ((fx : Int), (fy : Int))) }
+    scene := { scene with state := scene.state.drawLighting sceneCamera lightingDraw, blackFade := false }
+    if let some fault := scene.state.lightingFault then
+      throw (IO.userError s!"lighting stopped the session: {fault}")
+    scene := { scene with light := ← DrawLight.read scene.state.lighting }
+    -- END B-ZONE lighting-draw-globals
     drawn := true
     let waterScene := OriginalDesktopLiquid.sharedSceneWater waterScene camera.viewport terrain
       scene.state.sceneMetrics skyblockLowTiles
     let time := (scene.tick % 216000).toFloat
-    let light := fun x y => lightAt terrain x y false
+    let drawLight := scene.light
+    let light : OriginalDesktopLiquid.Light := fun x y => drawLight.color x y
     let liquidRenderer ← scene.liquidRenderer.prepareTargets camera.viewport terrain light waterScene.waterStyle time
     let (waterfallRenderer, waterfalls) := scene.waterfallRenderer.prepare camera.viewport terrain
       scene.state.liquids light liquidRenderer.alpha forceFindWaterfalls focused
     scene := { scene with liquidRenderer, waterScene, waterfallRenderer }
-    let sky := skyFrame scene camera
+    -- DoDraw's weather slices: cloudAlpha (IL_0516), Main.atmo (IL_074d), Main.DrawRain (IL_13ff) with this
+    -- draw's water style and the waterfall ambient sources Main.Ambience reads on the next update
+    let ambient : Option OriginalForest.AmbientSources := waterfalls.ambient.map fun a =>
+      { waterfallX := a.waterfallX, waterfallY := a.waterfallY, waterfallStrength := a.waterfallStrength
+        lavafallX := a.lavafallX, lavafallY := a.lavafallY, lavafallStrength := a.lavafallStrength }
+    -- `Lighting.GetColor` as FNA `Color.PackedValue` (`OriginalLightingRuntime.packedValue`)
+    let packed := fun (x y : Int) => drawLight.value x y
+    let weatherState := ((scene.state.noteDrawnScene waterScene.waterStyle ambient).drawCloudAlpha).drawAtmosphere sceneCamera
+    let (weatherState, rainDraws) := weatherState.drawRain sceneCamera packed focused
+    scene := { scene with state := weatherState, rainDraws }
     let localize := (residentResources.map fun r => scene.localize r playerName).getD (fun _ => none)
     let residentPanel := residentResources.bind fun resources =>
       scene.residentPanel resources.fonts localize keys mouseX mouseY
@@ -2450,11 +2714,18 @@ private def run (world : System.FilePath) (options : Options) : IO UInt32 := do
   let localTime ← Std.Time.PlainDateTime.now
   let ticks := localTime.toWallTime.toNanoseconds.val / 100 + 621355968000000000
   let loaderRandom := UnifiedRandom.seed ticks
+  -- BEGIN B-ZONE lighting-seeds-desktop (S01)
+  -- `new LightingEngine()`: three fresh Guid hashes (scanner, active map, working map) like the wind
+  -- hash, and the worker threads' `Main.rand` seeded from the millisecond clock (`Environment.TickCount`).
+  let lightingSeeds : OriginalSession.LightingSeeds := {
+    scannerHash := ← windHash, activeHash := ← windHash, workingHash := ← windHash
+    scanRandomSeed := (Int32.ofNat ((← IO.monoMsNow) % 4294967296)).toInt }
+  -- END B-ZONE lighting-seeds-desktop
   let state ← if options.greenSlime.isSome then
-      IO.ofExcept ((OriginalSession.startWithLiquids terrain loaderRandom).mapError IO.userError)
+      IO.ofExcept ((OriginalSession.startWithLiquids terrain loaderRandom lightingSeeds).mapError IO.userError)
     else do
       let guidHash ← windHash
-      IO.ofExcept ((OriginalSession.startArchive archive loaderRandom (some guidHash)).mapError IO.userError)
+      IO.ofExcept ((OriginalSession.startArchive archive loaderRandom lightingSeeds (some guidHash)).mapError IO.userError)
   let now ← OriginalPlayerFile.savedTimeNow
   let patch : Option FramePatch ← options.frames.mapM fun path => FramePatch.read path terrain (allowTerrainEdits := true)
   let initial : OriginalSession.State := { state with

@@ -1,4 +1,6 @@
 import Std.Data.HashMap
+import Lean4Terria.OriginalUndergroundSpawn
+import Lean4Terria.UnifiedRandom
 import Lean4Terria.OriginalCandleBuffs
 import Lean4Terria.OriginalSurfaceNightSpawn
 
@@ -230,6 +232,11 @@ structure World where
   offFlags : List (String × Bool) := []
   /-- Night inputs; `none` keeps the night branch (IL_4635) a boundary. -/
   night : Option NightInputs := none
+  /-- `Main.worldID` (`NPC.SetWorldSpecificMonstersByWorldID` seeds `NPC.cavernMonsterType` from it);
+  `none` makes the cavern layer a boundary. -/
+  worldID : Option Int := none
+  /-- `NPC.savedStylist` (the spider branch's Stylist). -/
+  savedStylist : Bool := false
 
 /-- The player the spawn is attempted near (`Main.player[i]`). -/
 structure Player where
@@ -252,6 +259,10 @@ structure Player where
   afkCounter : Int := 0
   /-- Player flags that must be false here (zones, buffs, `scope`, …). -/
   offFlags : List (String × Bool) := []
+  /-- `Spawner.offensiveToTim` (`SetSpawnFlags` IL_0372: `GetEffectiveArmor(1)` a robe 4256 / 1282‥1287
+  and `GetEffectiveArmor(0)` not the Wizard Hat 238); `none`: not decided by the caller (boundary where
+  the underground branch needs it). -/
+  offensiveToTim : Option Bool := none
 
 def Player.center (p : Player) : Float32 × Float32 :=
   (p.position.1 + i2f p.width / 2, p.position.2 + i2f p.height / 2)
@@ -636,6 +647,66 @@ structure TileFlags where
   deeperThanRockLayer : Bool
   isOcean : Bool
   isBeach : Bool
+  /-- `Spawner.spawnSpider` (`SetSpawnFlagsForChosenTile` IL_0312 … IL_03f2). -/
+  spawnSpider : Bool := false
+
+/-- `NPC.SetWorldSpecificMonstersByWorldID` (g02-runtime/il): `UnifiedRandom(Main.worldID)`, two distinct
+kinds from `Next(3)` (the second redrawn while equal), then three types for each row: kind 0
+`Next(494, 496)`, kind 1 `Next(496, 498)`, kind 2 `Next(498, 507)`. Row-major `[a * 3 + b]`. -/
+def cavernMonsterTypes (worldID : Int) : Array Int := Id.run do
+  let mut r := UnifiedRandom.seed worldID
+  let (a, r1) := r.next 0 3
+  let (b, r2) := r1.next 0 3
+  let mut a := a
+  r := r2
+  while a == b do
+    let (a', r') := r.next 0 3
+    a := a'
+    r := r'
+  let mut out := #[]
+  for row in [0:2] do
+    let kind := if row == 1 then b else a
+    for _ in [0:3] do
+      let (lo, hi) : Int × Int := if kind == 0 then (494, 496) else if kind == 1 then (496, 498) else (498, 507)
+      let (t, r') := r.next lo hi
+      out := out.push t
+      r := r'
+  return out
+
+/-- The released `OriginalUndergroundSpawn.Ops` on this attempt's stream: births collected in request
+order (`Spawner.SpawnNPC` with its pinky roll is applied by the caller through `spawnOne`). -/
+private def undergroundOps (w : World) (p : Player) :
+    OriginalUndergroundSpawn.Ops (StateT (Array OriginalSurfaceNightSpawn.Birth) M) := {
+  next := fun site max => (nextN site max : M Int)
+  nextRange := fun site lo hi => (nextR site lo hi : M Int)
+  rollLuck := fun site range => (rollLuck site p.luck range : M Int)
+  rollOnlyBadLuck := fun site range => (rollOnlyBadLuck site p.luck range : M Int)
+  countNPCs := fun t => do
+    let born ← get
+    return countNPC w t + Int.ofNat (born.filter (·.typeId == t)).size
+  anyNPCs := fun t => do
+    let born ← get
+    return countNPC w t > 0 || born.any (·.typeId == t)
+  anyHelpfulFairies := (unsupported "Spawner::SpawnAnNPC: NPC.AnyHelpfulFairies (fairy branch)" : M Bool)
+  spawn := fun _ birth => modify (·.push birth) }
+
+private def spiderContext (w : World) (pX pY x y : Int) (zoneDungeon waterTile : Bool) :
+    M OriginalUndergroundSpawn.SpiderContext := do
+  -- every wall the scan can read is inside the world (it skips squares that do not fit horizontally)
+  let walls ← (List.range 31).foldlM (init := (#[] : Array (Array Nat))) fun acc (i : Nat) => do
+    let row ← (List.range 31).foldlM (init := (#[] : Array Nat)) fun r (j : Nat) => do
+      let tx := x - 15 + Int.ofNat i
+      let ty := y - 15 + Int.ofNat j
+      if inWorld w tx ty 0 then return r.push (← tileAt w tx ty).wall else return r.push 0
+    return acc.push row
+  let playerWall ← if inWorld w pX pY 0 then pure (← tileAt w pX pY).wall else pure 0
+  return {
+    x, y, pX, pY, rockLayer := w.rockLayer, maxTilesX := w.maxTilesX, maxTilesY := w.maxTilesY
+    underworldLayer := w.underworldLayer, zoneDungeon, invaders := false
+    deeperThanRockLayer := !(Float.ofInt y < w.rockLayer), waterTile, savedStylist := w.savedStylist
+    wallAt := fun i j =>
+      if i == pX && j == pY then playerWall
+      else ((walls[(i - x + 15).toNat]?).bind (·[(j - y + 15).toNat]?)).getD 0 }
 
 /-- `SetSpawnFlagsForChosenTile(x, y, groundY, tileType, wallType)` (no remix / dual-dungeon seed).
 `pX`, `pY` are `Spawner.pX/pY`: the player's centre in tiles. -/
@@ -686,8 +757,9 @@ def chosenTileFlags (w : World) (pX pY x y : Int) (tileType : Nat) (dungeon := f
           if c.type == 368 then nearGranite := true
           j := j + stepY
         i2 := i2 + step2
-  -- IL_0312: spider caves only below the rock layer
-  if !dungeon && Float.ofInt y > w.rockLayer then unsupported s!"{s} IL_0319: spawn tile below the rock layer"
+  -- IL_0312 … IL_03f2: the spider scan (released OriginalUndergroundSpawn.spiderScan)
+  let spider ← spiderContext w pX pY x y dungeon waterTile
+  let (spawnSpider, _) ← (OriginalUndergroundSpawn.spiderScan (undergroundOps w { whoAmI := 0, active := true, dead := false, position := (0, 0) }) spider).run #[]
   -- IL_03f3: underground-desert walls, for every row 200 < y < rockLayer (surface included)
   let mut desert := false
   if !dungeon && Float.ofInt y < w.rockLayer && y > 200 then
@@ -707,7 +779,7 @@ def chosenTileFlags (w : World) (pX pY x y : Int) (tileType : Nat) (dungeon := f
   if !isOcean && tileType == 53 then
     unsupported s!"{s} IL_053d: sand tile (WorldGen.oceanDepths)"
   let isBeach := !(Float.ofInt y > w.worldSurface) && (x < w.beachDistance || x > w.maxTilesX - w.beachDistance)
-  return ⟨waterTile, nearMarble, nearGranite, desert, surfaceSpawn, deeper, isOcean, isBeach⟩
+  return ⟨waterTile, nearMarble, nearGranite, desert, surfaceSpawn, deeper, isOcean, isBeach, spawnSpider⟩
 
 /-! ## `SpawnAnNPC`: the surface daytime path -/
 
@@ -724,13 +796,24 @@ def basicSlime (w : World) (tileType : Nat) (dist : Int) : M Int := do
 /-- `Spawner.SpawnNPC(x, y, type, …)`: the 1/180 pinky roll for every netID whose type is 1. -/
 def spawnOne (x y type : Int) (luck : Float32) : M (Int × Int × Int) := do
   let mut type := type
-  -- NPCID.FromNetId(type) == 1: blue 1, green −3, purple −7, red −8, yellow −9, jungle −10
-  if type == 1 || type == -3 || type == -7 || type == -8 || type == -9 || type == -10 then
+  -- NPCID.FromNetId(type) == 1 in the running original: 1, −3 … −10 (L4 INTERFACE "Caller fact")
+  if type == 1 || (-10 ≤ type && type ≤ -3) then
     if (← rollLuck "Spawner::SpawnNPC IL_000f" luck 180) == 0 then type := -4
   return (type, x, y)
 
 def spawnNPC (x y type : Int) (luck : Float32) : M Outcome := do
   return .spawned [← spawnOne x y type luck]
+
+/-- Births requested through the released spawner ops, each through `Spawner.SpawnNPC` (`spawnOne`,
+its pinky roll included) in request order. `ai2` / `TargetClosest` births (the fairy) have no session
+actor contract yet: boundary. -/
+private def bornAll (births : Array OriginalSurfaceNightSpawn.Birth) (luck : Float32) : M Outcome := do
+  if births.any (fun b => b.ai2 != 0 || b.targetClosest) then
+    unsupported "Spawner::SpawnAnNPC: a birth with ai2 / TargetClosest (fairy)"
+  let mut out := []
+  for b in births do
+    out := out ++ [← spawnOne b.x b.y b.typeId luck]
+  return .spawned out
 
 private def dungeonSpawn (w : World) (p : Player) (f : TileFlags) (x y : Int) : M Outcome := do
   let site := "Spawner::SpawnAnNPC"
@@ -948,7 +1031,11 @@ def spawnAnNPC (w : World) (p : Player) (f : TileFlags) (x y : Int) (tileType wa
   -- flags are not read here: their only reads (IL_c568, IL_c605) lie behind the cavern guard below.
   if wallType == 244 then unsupported s!"{s} IL_0c36: living-tree wall"
   if w.readyToFindBartender then unsupported s!"{s} IL_1029: bartender"
-  if (← tileAt w x y).wall == 62 then unsupported s!"{s} IL_1091: spider wall"
+  -- IL_107e … IL_11c9: the spider branch (released OriginalUndergroundSpawn.spiderBranch)
+  let (cx, cy) := p.center
+  let spider ← spiderContext w (idiv (truncF32 cx) 16) (idiv (truncF32 cy) 16) x y p.zoneDungeon waterTile
+  let (spiderOut, spiderBirths) ← (OriginalUndergroundSpawn.spiderBranch (undergroundOps w p) spider f.spawnSpider).run #[]
+  if let some _ := spiderOut then return ← bornAll spiderBirths p.luck
   -- IL_11d1 SpawnTileOrAboveHasAnyWallInSet(x, y, AllowsUndergroundDesertEnemiesToSpawn)
   if inWorld w x y 2 then
     let a := (← tileAt w x y).wall
@@ -975,6 +1062,29 @@ def spawnAnNPC (w : World) (p : Player) (f : TileFlags) (x y : Int) (tileType wa
       return ← spawnNPC bx by' 685 p.luck
   if friendly then return ← friendlyBranch w p f y tileType tooWindy inSafeX bx by'
   if p.zoneDungeon then return ← dungeonSpawn w p f x y
+  -- IL_45d5 below the surface, day or night: the released OriginalUndergroundSpawn.underground
+  -- (replaces the night IL_462b boundary and the day dirt-layer code, of which it is a superset)
+  if Float.ofInt y > w.worldSurface then
+    let some worldID := w.worldID | unsupported s!"{s}: Main.worldID unknown (NPC.cavernMonsterType)"
+    let some n := w.night | unsupported s!"{s}: Main.halloween unknown (no season from the caller)"
+    let some tim := p.offensiveToTim | unsupported s!"{s}: Spawner.offensiveToTim undecided (armor)"
+    let cavern := cavernMonsterTypes worldID
+    let c : OriginalUndergroundSpawn.Context := {
+      x, y, tileType, wallType, wallAtTile := (← tileAt w x y).wall
+      worldSurface := w.worldSurface, rockLayer := w.rockLayer, maxTilesY := w.maxTilesY, dayTime := w.dayTime
+      waterTile, livingTree, noWorms, underGround := !(Float.ofInt y > w.rockLayer)
+      nearMarble := f.nearMarble, nearGranite := f.nearGranite
+      offensiveToTim := tim, zoneShadowCandle := p.candleZones.shadow
+      fairyLog := w.fairyLog, halloween := n.halloween, expertMode := w.expertMode
+      goldCritterChance := Int.ofNat w.goldCritterChance
+      cavernMonsterType := fun a b => cavern[(a * 3 + b).toNat]?.getD 0
+      -- `Main.raining` is not read below the surface (Spawner.raining sites all lie on the surface paths)
+      offFlags := w.offFlags.filter (·.1 != "raining") ++ p.offFlags.filter (·.1 != "ZoneDungeon") }
+    let (result, births) ← (OriginalUndergroundSpawn.underground (undergroundOps w p) c).run #[]
+    match result with
+    | .error (.boundary site why) => unsupported s!"{site}: {why}"
+    | .ok (.nothing site) => return .nothing site
+    | .ok (.spawned _) => return ← bornAll births p.luck
   -- IL_45d5 … IL_7094: meteor and DD2 are off; the surface-night and cavern-remix branches are
   -- skipped by day (IL_4635, IL_5dea) or below the surface line (IL_462b, IL_5de0, IL_706d)
   if !w.dayTime then return ← surfaceNightBranch w p f x y tileType wallType livingTree tooWindy zombieFamily

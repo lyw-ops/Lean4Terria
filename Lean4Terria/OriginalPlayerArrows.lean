@@ -2,6 +2,7 @@ import Lean4Terria.OriginalForestGuideArrow
 import Lean4Terria.OriginalStarterMelee
 import Lean4Terria.OriginalNpcCombatText
 import Lean4Terria.OriginalLuck
+import Lean4Terria.OriginalTileHitEffects
 
 /-!
 # Local-player Wooden Arrow (Terraria desktop 1.4.5.8 Classic)
@@ -23,7 +24,7 @@ type-1 branch), so `recoveryRequests` is always empty. Evidence: `.lake/original
 namespace Lean4Terria.OriginalPlayerArrows
 
 open OriginalCollision (Grid Vector single)
-open OriginalStarterMelee (Npc Rect OnKill OnStrike Strike truncF32 toRotation)
+open OriginalStarterMelee (Npc Rect OnKill OnStrike OnSound NpcSound Strike truncF32 toRotation)
 open OriginalForestGuideArrow (DustPool DustRequest DustParticle)
 
 def typeId : Nat := 1
@@ -171,6 +172,13 @@ structure Context where
   text : OriginalNpcCombatText.State := {}
   onKill : OnKill := fun _ _ random => (#[], random)
   onStrike : OnStrike := OriginalStarterMelee.noStrikeEffects
+  /-- The struck NPC's `HitSound` (after `HitEffect`) and, when it died, `DeathSound` (in `checkDead`, before
+  `NPCLoot`), resolved by the caller's sound channel on this stream (`OriginalNpcSound.strike`), exactly as in
+  `OriginalStarterMelee.meleeHitNpcsWithText`. -/
+  onSound : OnSound := OriginalStarterMelee.noStrikeSound
+  /-- `Kill`'s `SoundEngine.PlaySound(0, (int)position.X, (int)position.Y, 1)` (Dig, the int overload: no
+  `SoundStyle._random` sample), before the ten dust. `digSound` is the original channel for it. -/
+  onKillSound : Vector → UnifiedRandom → Option NpcSound × UnifiedRandom := fun _ random => (none, random)
 
 inductive EndReason where
   | tile | enemy | expired | outsideWorld
@@ -183,6 +191,10 @@ structure Hit where
   direction : Int
   fromPlayer : Nat
   gore : Array OriginalGore.Particle := #[]
+  /-- What the caller's channel resolved for `HitSound` / `DeathSound`, in call order. -/
+  sounds : Array NpcSound := #[]
+  /-- `PlaySound(LegacySoundStyle, …)` calls of this strike: one client `SoundStyle._random` sample each, heard or not. -/
+  styleCalls : Nat := 0
 
 structure Step where
   text : OriginalNpcCombatText.State := {}
@@ -192,6 +204,8 @@ structure Step where
   dust : Array DustParticle := #[]
   hit : Option Hit := none
   ended : Option EndReason := none
+  /-- The resolved Dig sound of this update's `Kill`, if any. -/
+  sounds : Array NpcSound := #[]
 
 /-- Item requests from the arrow's own death. Empty in 1.4.5.8 for type 1 (see the module note). -/
 def recoveryRequests (_ : Step) : Array OriginalItems.Drop := #[]
@@ -261,8 +275,28 @@ private def emitDust (step : Step) (request : DustRequest) (count : Nat) : Step 
     step := { step with dustPool, random, dust := particle.elim step.dust step.dust.push }
   return step
 
-/-- `Kill` for type 1: sound, ten dust 7 at the arrow, `active = false`, `timeLeft = 0`. -/
-private def kill (step : Step) (reason : EndReason) : Step :=
+/-- `LegacySoundPlayer.PlaySound` type 0 (Dig) at `(int)position`, ready assets: audible → variation `Next(3)`, then
+pitch `Next(-10, 11) × 0.01` from the current stream; positional volume and pan as for every legacy sound. -/
+def digSound (context : OriginalTileHitEffects.Context) (position : Vector) (random : UnifiedRandom) :
+    Option NpcSound × UnifiedRandom := Id.run do
+  if context.dedicatedServer || !context.audioSupported || context.soundVolume == 0 then return (none, random)
+  if context.generating || context.netMode == 2 then return (none, random)
+  let dx := single position.x.toInt32.toInt - context.cameraCenter.x
+  let dy := single position.y.toInt32.toInt - context.cameraCenter.y
+  let distance := Float32.sqrt (dx * dx + dy * dy)
+  if !(distance < context.attenuationDistance) then return (none, random)
+  let clamp (lo hi v : Float32) : Float32 := if v < lo then lo else if v > hi then hi else v
+  let pan := clamp (-1) 1 (dx / (context.maxWorldViewWidth * 0.5))
+  let volume := min 1 (clamp 0 1 (1 - distance / context.attenuationDistance) * context.soundVolume)
+  if !(volume > 0) then return (none, random)
+  let (variation, random) := random.next 0 3
+  let (pitch, random) := random.next (-10) 11
+  return (some { typeId := 0, style := 1, variation := variation.toNat, volume, pan, pitch := single pitch * 0.01 }, random)
+
+/-- `Kill` for type 1: the Dig sound, ten dust 7 at the arrow, `active = false`, `timeLeft = 0`. -/
+private def kill (ctx : Context) (step : Step) (reason : EndReason) : Step :=
+  let (sound, random) := ctx.onKillSound step.arrow.position step.random
+  let step := { step with random, sounds := step.sounds ++ sound.toArray }
   let step := emitDust step { position := step.arrow.position, width, height, typeId := 7 } 10
   { step with ended := some reason, arrow := { step.arrow with active := false, timeLeft := 0 } }
 
@@ -305,9 +339,15 @@ private def hitNpc (ctx : Context) (step : Step) (slot : Nat) (target : Target) 
     { strike with npc := { npc with active := !died }, died := died, random := result.random, text := result.text }
   let effects := ctx.onStrike result.dust slot direction strike
   let (effectDust, random) := (effects.dust, effects.random)
+  -- StrikeNPC_Inner IL_0b1a..0b5d HitSound after HitEffect; checkDead IL_05d0 DeathSound before NPCLoot
+  let (hitSound, hitCalled, random) := ctx.onSound false slot strike.npc random
+  let (deathSound, deathCalled, random) :=
+    if died then ctx.onSound true slot strike.npc random else (none, false, random)
   let (drops, random) := if died then ctx.onKill slot npc random else (#[], random)
   let hit : Hit :=
-    { slot, strike := { strike with random }, drops, direction, fromPlayer := step.arrow.owner, gore := effects.gore }
+    { slot, strike := { strike with random }, drops, direction, fromPlayer := step.arrow.owner, gore := effects.gore
+      sounds := hitSound.toArray ++ deathSound.toArray
+      styleCalls := (if hitCalled then 1 else 0) + (if deathCalled then 1 else 0) }
   return { result with
     random, hit := some hit, dust := result.dust ++ effectDust
     dustPool := result.dustPool.occupy effectDust
@@ -331,15 +371,15 @@ def step (ctx : Context) (arrow : Arrow) (targets : Array (Option Target))
   let mut step := { start with arrow }
   if collided then
     -- HandleMovement: tile-484 cut scan, Next(3) (on 0 a second cut scan, no effect in dry terrain), Kill.
-    step := kill { step with random := (step.random.next 0 3).2 } .tile
+    step := kill ctx { step with random := (step.random.next 0 3).2 } .tile
     return { step with arrow := changeDirection (advancePosition step.arrow) }
   step := { step with arrow := changeDirection arrow }
   if let some (slot, target) := firstTarget targets step.arrow then
     step := hitNpc ctx step slot target
   if step.text.boundary.isSome then return step
   step := { step with arrow := { step.arrow with timeLeft := step.arrow.timeLeft - 1 } }
-  if step.arrow.timeLeft == 0 then return kill step .expired
-  if step.arrow.penetrate == 0 then return kill step .enemy
+  if step.arrow.timeLeft == 0 then return kill ctx step .expired
+  if step.arrow.penetrate == 0 then return kill ctx step .enemy
   return step
 
 end Lean4Terria.OriginalPlayerArrows
