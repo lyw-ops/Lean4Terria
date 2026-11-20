@@ -27,7 +27,13 @@ import Lean4Terria.OriginalPlayerRandom
 import Lean4Terria.OriginalManaHeat
 import Lean4Terria.OriginalPlayerWet
 import Lean4Terria.OriginalRecipeCraft
-import Lean4Terria.OriginalSceneMetricsClock
+-- BEGIN B-ZONE lighting-import (S01)
+import Lean4Terria.OriginalLightingRuntime
+import Lean4Terria.OriginalLightingRuntime.Statics
+-- END B-ZONE lighting-import
+-- BEGIN B-ZONE actions-import (S02)
+import Lean4Terria.OriginalPlayerActions
+-- END B-ZONE actions-import
 import Lean4Terria.OriginalSelectedItemState
 import Lean4Terria.OriginalSpawn
 import Lean4Terria.OriginalStorage
@@ -107,6 +113,12 @@ structure ClientInput where
   gfxQuality : Float32 := 1
   /-- `Main.FlashyEffectsWorld` (lightning), an option; the static initializer's value is true. -/
   flashyEffectsWorld : Bool := true
+  -- BEGIN B-ZONE actions-client-keys (S02)
+  /-- `Player.controlQuickHeal` / `controlQuickMana` (`PlayerInput.Triggers.Current.QuickHeal/QuickMana`,
+  default keys H / B). A driver that does not declare them leaves both false. -/
+  controlQuickHeal : Bool := false
+  controlQuickMana : Bool := false
+  -- END B-ZONE actions-client-keys
 
 structure ContactDeathText where
   playerName : String := "Player"
@@ -179,10 +191,18 @@ structure State where
   itemUse : Timing := {}
   combat : OriginalCombat.State := {}
   forest : Option OriginalForest.State := none
-  miningHits : HitCache := {}
+  -- BEGIN B-ZONE actions-hit-tile (S02)
+  /-- `Player.hitTile`: the ONE native table that pickaxes, hammers and axes share (tile entries type 1,
+  wall entries type 2). Owners still written against `OriginalMining.HitCache` (the copper pick with its
+  chest/bank/gravestone routing, the copper axe, the block-swap drop) read and write its tile entries
+  through `hitCacheOf` / `adoptHitCache`. -/
+  hits : OriginalHammerForeground.HitTile := {}
+  /-- `Player.hitReplace`: natively a SEPARATE `HitTile` (block replacement, `TryReplacingTiles`), not part
+  of `hitTile`. Kept as the block-swap owner's `HitCache`; `OriginalMiningTools.State.hitReplace` takes it
+  through the same adapter. -/
   swapHits : HitCache := {}
+  -- END B-ZONE actions-hit-tile
   wallFrames : OriginalWallWork.WallFrames := {}
-  hammerHits : OriginalHammerForeground.HitTile := {}
   poundRelease : Bool := false
   tileFrameNumbers : OriginalHammerForeground.TileFrameNumbers := {}
   wallUseHeld : Bool := false
@@ -203,8 +223,44 @@ structure State where
   lastItemUseAttemptSuccess : Bool := false
   /-- The latest client update reached `SelectedItemState.Select`'s `PlaySound(12)`. -/
   selectionMenuTick : Bool := false
-  /-- LightingEngine `_state` with `Main.mapDelay` and `Main.renderCount`. -/
-  sceneClock : OriginalSceneMetricsClock.State := {}
+  -- BEGIN B-ZONE lighting-state (S01)
+  /-- `Lighting._activeEngine` (new lighting) with the `Main` statics it writes (`mapDelay`,
+  `renderCount`, `updateMap`), `Lighting.GlobalBrightness` and the declared worker `Main.rand`.
+  The engine's `_state` is the only lighting phase counter of the session. Created by `start` from
+  the caller's `LightingSeeds`; there is deliberately no default. -/
+  lighting : OriginalLightingRuntime.Runtime
+  /-- `Main.tileColor` as the latest world draw's `ApplyColorOfTheSkiesToTiles` (DoDraw IL_0735) left
+  it; `none` before the first world draw. The renderNow `LightTiles` passes (IL_039e/03a8) run
+  before that draw's `SetBackColor` and read this value. -/
+  tileColor : Option OriginalLightingRuntime.SColor := none
+  /-- `Main.demonTorch` / `demonTorchDir` (`DoUpdate_AnimateTileGlows`, DoUpdate IL_0873). Starts at
+  the `Main..cctor` state; BOUNDARY: the menu updates before world entry are not counted. -/
+  tileGlows : OriginalLightingRuntime.Statics.TileGlows := {}
+  /-- `Main.timeForVisualEffects` (DoUpdate IL_08cc). Starts at the `.cctor` 0; BOUNDARY: the menu
+  updates before world entry are not counted. -/
+  timeForVisualEffects : Float := 0
+  /-- A `LightingEngine` fault (natively a worker exception that crashes the game). Fatal: once set,
+  no further update or `LightTiles` call runs and the driver must stop with this text. -/
+  lightingFault : Option String := none
+  -- END B-ZONE lighting-state
+  -- BEGIN B-ZONE actions-state (S02)
+  /-- `Player.potionDelay` / `manaPotionDelay` (counted down at Player.Update IL_0a7a..0aa8; `potionDelay`
+  mirrors a live Potion Sickness buff in UpdateBuffs). `Player..ctor` leaves both 0. -/
+  potionDelay : Int := 0
+  manaPotionDelay : Int := 0
+  /-- `Player.releaseQuickHeal` / `releaseQuickMana`: `Player..ctor` does not write them (CLR false). -/
+  releaseQuickHeal : Bool := false
+  releaseQuickMana : Bool := false
+  /-- This update's QuickHeal / QuickMana `PlaySound(item.UseSound, position)` requests and, for a window
+  client with audio, their resolved instances (in call order). -/
+  quickSoundRequests : Array OriginalTileHitEffects.SoundRequest := #[]
+  quickSounds : Array OriginalTileHitEffects.PlayedSound := #[]
+  -- END B-ZONE actions-state
+  -- BEGIN B-ZONE projectiles-state (S03)
+  /-- `Player.revolverCritChanceBonus` (ItemCheck IL_02f4 lowers it on a `Next(3) == 0` for every
+  non-Revolver held item the bow path runs); `Player..ctor` leaves 0. -/
+  revolverCritChanceBonus : Int := 0
+  -- END B-ZONE projectiles-state
   /-- `Main.renderNow`. -/
   renderNow : Bool := false
   /-- `DoUpdateInWorld_Inner` calls since the world was entered (`GameUpdateCount - 65536`). -/
@@ -325,12 +381,19 @@ def State.equipmentBoundaries (state : State) : Array String := Id.run do
     (e.anglerSetSpawnReduction, "anglerSetSpawnReduction"),
     (e.spikedBoots != 0, "spikedBoots"), (e.rocketBoots != 0, "rocketBoots"),
     (e.meleeSpeed.toBits != (1 : Float32).toBits, "meleeSpeed"),
-    (e.meleeDamage.toBits != (1 : Float32).toBits || e.rangedDamage.toBits != (1 : Float32).toBits ||
-      e.magicDamage.toBits != (1 : Float32).toBits || e.minionDamage.toBits != (1 : Float32).toBits, "damage multipliers"),
-    (e.meleeCrit != 4 || e.rangedCrit != 4 || e.magicCrit != 4, "critical strike chance"),
+    -- BEGIN B-ZONE weapons-equipment-flags (S04): melee damage/crit reach the starter weapons and ranged damage the
+    -- bow through weaponNumbers / BowUse; magic and minion damage have no consumer
+    (e.magicDamage.toBits != (1 : Float32).toBits || e.minionDamage.toBits != (1 : Float32).toBits, "magic/minion damage multipliers"),
+    (e.magicCrit != 4, "magic critical strike chance"),
+    -- END B-ZONE weapons-equipment-flags
     (e.manaCost.toBits != (1 : Float32).toBits, "manaCost"), (e.pickSpeed.toBits != (1 : Float32).toBits, "pickSpeed")]
   for (active, name) in flags do
     if active then out := out.push s!"{name}: computed from the equipment, no consumer in the session yet"
+  -- BEGIN B-ZONE weapons-ranged-crit (S04): consumed by the bow's arrows, but the equipment leaf's ranged crit from
+  -- armor is an unverified coverage hole (Root: effects-minion-crit)
+  if e.rangedCrit != 4 then
+    out := out.push s!"rangedCrit {e.rangedCrit}: from the equipment, used by arrows, not covered natively (effects-minion-crit)"
+  -- END B-ZONE weapons-ranged-crit
   return out
 
 /-- The movement statistics equipment changes: `Player.Update` IL_331a..333b (`runAcceleration` and
@@ -363,7 +426,48 @@ private def State.adoptTerrain (state : State) (terrain : Terrain)
     foregroundEdits := state.foregroundEdits ++ cells.toArray }
   return state.commitLiquids runtime
 
-def State.wallHits (state : State) : OriginalWallWork.WallHits := state.hammerHits.walls
+def State.wallHits (state : State) : OriginalWallWork.WallHits := state.hits.walls
+
+-- BEGIN B-ZONE actions-hit-adapter (S02)
+/-- The live tile entries (type 1, time to live > 0) of a `HitTile` as an `OriginalMining.HitCache`, most
+recently sorted first (`order[1]` is the latest `SortSlots`). The prepared buffer slot is not live. -/
+def hitCacheOf (h : OriginalHammerForeground.HitTile) : HitCache :=
+  { entries := h.order.filterMap fun slot => do
+      let e ← h.data[slot]?
+      guard (e.type == 1 && e.timeToLive > 0 && e.x ≥ 0 && e.y ≥ 0)
+      return ⟨⟨e.x.toNat, e.y.toNat⟩, e.damage.toNat, e.timeToLive.toNat⟩ }
+
+/-- Write a legacy owner's resulting `HitCache` back into the tile entries of the native table: entries the
+owner dropped are `Clear`ed, changed ones take its damage and time to live (a re-recorded entry, time to live
+60, is `SortSlots`ed like `AddDamage`), new ones are placed with `HitObject` then `SortSlots`, oldest first.
+Wall entries are untouched. BOUNDARY: the slot order these owners imply is approximated (their caches have
+no slots); damage and time to live are theirs exactly. -/
+def adoptHitCache (h : OriginalHammerForeground.HitTile) (cache : HitCache) : OriginalHammerForeground.HitTile := Id.run do
+  let mut h := h
+  for slot in [:h.data.size] do
+    let e := h.data[slot]!
+    if e.type != 1 || e.timeToLive ≤ 0 then continue
+    match cache.entries.find? fun hit => (hit.cell.x : Int) == e.x && (hit.cell.y : Int) == e.y with
+    | none => h := OriginalMiningTools.Hits.clear h slot
+    | some hit =>
+      if (hit.damage : Int) != e.damage || (hit.timeToLive : Int) != e.timeToLive then
+        h := { h with data := h.data.set! slot { e with damage := hit.damage, timeToLive := hit.timeToLive } }
+        if hit.timeToLive == 60 then h := OriginalMiningTools.Hits.sortSlots h slot
+  for hit in cache.entries.reverse do
+    let live := h.data.any fun e => e.type == 1 && e.timeToLive > 0 &&
+      e.x == (hit.cell.x : Int) && e.y == (hit.cell.y : Int)
+    if live then continue
+    let (h', slot) := OriginalMiningTools.Hits.hitObject h hit.cell.x hit.cell.y 1
+    let e := h'.data[slot]!
+    h := OriginalMiningTools.Hits.sortSlots
+      { h' with data := h'.data.set! slot { e with damage := hit.damage, timeToLive := hit.timeToLive } } slot
+  return h
+
+/-- `HitTile.Prune()` applied to the wall entries only (the legacy copper pick prunes its tile entries itself). -/
+private def pruneWallHits (h : OriginalHammerForeground.HitTile) (terrain : Terrain) : OriginalHammerForeground.HitTile :=
+  let pruned := h.prune terrain
+  { h with data := h.data.mapIdx fun slot e => if e.type == 2 then pruned.data[slot]! else e }
+-- END B-ZONE actions-hit-adapter
 
 def State.carriedItems (state : State) : OriginalItems.Inventory := state.inventory ++ state.coinAndAmmo
 
@@ -592,7 +696,7 @@ def State.craftRecipe (state : State) (nearbyEnabled : Bool) (index requested : 
     mouseItem := result.mouseItem, chests := result.chests, banks := result.banks }
 
 def State.copperPick (state : State) : CopperPick :=
-  ⟨state.itemUse, state.miningHits⟩
+  ⟨state.itemUse, hitCacheOf state.hits⟩
 
 /-- `inventory[index]` of the original 59-slot array. Slot 58 is the cursor mirror that
 `dropItemCheck` refreshes from `Main.mouseItem`; this session keeps the one cursor stack. -/
@@ -701,33 +805,64 @@ private def spawnBody (spawn : OriginalSpawn.Spawn) : OriginalPlayerCollision.Bo
   let position := spawn.position 20 42
   { position, velocity := ⟨0, 0⟩, fallStart := tileIndex position.y }
 
+-- BEGIN B-ZONE lighting-seeds (S01)
+/-- The non-reproducible inputs of `new LightingEngine()` (`Lighting.Initialize`).
+
+Seed policy: natively the three `Guid.NewGuid().GetHashCode()` values (scanner `_random`, active
+map, working map `FastRandom.CreateWithRandomSeed`) and the worker threads' `[ThreadStatic]`
+`Main.rand` (seeded from `Environment.TickCount` on first use, scheduling-dependent) are fresh per
+process and not reproducible. A caller with entropy passes its own (the desktop: three
+`IO.getRandomBytes` hashes like its wind hash, and the monotonic millisecond clock for the worker
+stream). Headless and replay sessions pass `LightingSeeds.declared`. The replays compare only the
+lighting phase counters (`_state`, `Main.renderCount`, `Main.mapDelay`, `Main.renderNow`), never
+light values, so the declared seeds do not affect any replay result. -/
+structure LightingSeeds where
+  scannerHash : Int32
+  activeHash : Int32
+  workingHash : Int32
+  /-- Seed of the declared worker-thread `Main.rand` stream (`UnifiedRandom.seed`). -/
+  scanRandomSeed : Int
+
+/-- The declared seeds of a headless / replay session (all zero; see `LightingSeeds`). -/
+def LightingSeeds.declared : LightingSeeds :=
+  { scannerHash := 0, activeHash := 0, workingHash := 0, scanRandomSeed := 0 }
+
+/-- `new LightingEngine()` with `Main.mapDelay`/`renderCount` at their static zero and no
+`Main.updateMap`; world entry (`enterClient`) then writes `mapDelay := 2`. -/
+def LightingSeeds.create (seeds : LightingSeeds) : OriginalLightingRuntime.Runtime :=
+  OriginalLightingRuntime.create seeds.scannerHash seeds.activeHash seeds.workingHash
+    { mapDelay := 0, renderCount := 0, updateMap := none } (UnifiedRandom.seed seeds.scanRandomSeed)
+-- END B-ZONE lighting-seeds
+
 /-- Start a regular-world character at the world's shared spawn. The caller
 can apply spawn clearance before retrying when the spawn is blocked. -/
-def start (terrain : Terrain) : Except String State := do
+def start (terrain : Terrain) (lightingSeeds : LightingSeeds) : Except String State := do
   let spawn := worldSpawn terrain
   if spawn.requiresClearance then throw "World spawn requires clearance."
   let seed := OriginalWorld.numericSeed terrain.header.seed
   let itemRandom := UnifiedRandom.seed seed
   return { terrain, itemRandom, player := { body := spawnBody spawn }, health := ({} : Health).spawn true
-           combat := { npcRandom := OriginalGreenSlime.Rng.seed seed, projectileRandom := itemRandom } }
+           combat := { npcRandom := OriginalGreenSlime.Rng.seed seed, projectileRandom := itemRandom }
+           lighting := lightingSeeds.create }
 
 /-- The desktop world entry settles liquids before finding the spawn and
 starts the per-world `UpdateLiquid` stream. -/
-def startWithLiquids (terrain : Terrain) (loaderRng : UnifiedRandom) : Except String State := do
+def startWithLiquids (terrain : Terrain) (loaderRng : UnifiedRandom) (lightingSeeds : LightingSeeds) :
+    Except String State := do
   let seed := OriginalWorld.numericSeed terrain.header.seed
   let (runtime, report) := OriginalLiquid.Runtime.load terrain seed loaderRng
     (hooks := OriginalLiquid.objectHooks)
   let (changes, runtime) := runtime.takeChanges
-  let state ← start runtime.terrain
+  let state ← start runtime.terrain lightingSeeds
   return { state.applyLiquidChanges runtime changes with craftRandom := report.loaderRandom }
 
 /-- Load the resident slots and the ordinary forest's independent phase streams.
 The desktop caller supplies the independent wind hash to enable the outer weather update. -/
-def startArchive (archive : OriginalWorld.Archive) (loaderRng : UnifiedRandom)
+def startArchive (archive : OriginalWorld.Archive) (loaderRng : UnifiedRandom) (lightingSeeds : LightingSeeds)
     (windGuidHash : Option Int32 := none) : Except String State := do
   let header := archive.terrain.header
   let (background, loaderRng) := OriginalForestClock.rollCloudBackground header.cloudBackgroundActive loaderRng
-  let state ← startWithLiquids archive.terrain loaderRng
+  let state ← startWithLiquids archive.terrain loaderRng lightingSeeds
   let combat := state.combat.loadNpcs (← archive.readNpcs)
   let banner (id : Nat) : OriginalAngryBones.BannerProgress :=
     { kills := header.bannerKills.getD id 0, claimable := header.claimableBanners.getD id 0 }
@@ -856,8 +991,8 @@ private def State.useGravestonePick (state : State) (held : Bool) (cell : Cell)
     activeGhosts := state.combat.ghosts.countP (·.active) }
   let rules : OriginalMining.WorldRules := { surface := state.terrain.header.surface }
   let spawnGhost := state.spawnGravestoneGhost
-  let strike := if id == 85 then OriginalPlayerDeath.hitGravestone rules world state.miningHits cell 35 spawnGhost
-    else OriginalPlayerDeath.hitGravestoneSupport rules world state.miningHits cell 35 spawnGhost
+  let strike := if id == 85 then OriginalPlayerDeath.hitGravestone rules world (hitCacheOf state.hits) cell 35 spawnGhost
+    else OriginalPlayerDeath.hitGravestoneSupport rules world (hitCacheOf state.hits) cell 35 spawnGhost
   let mined := strike.world
   let broken := (mined.terrain.tile? cell.x cell.y).all (·.id.isNone)
   let drop := if !broken then none
@@ -866,7 +1001,7 @@ private def State.useGravestonePick (state : State) (held : Bool) (cell : Cell)
   let terrain := if broken then OriginalPlacement.reframeAfterRemoval mined.terrain cell else mined.terrain
   let combat := mined.spawnedGhosts.foldl (fun combat ghost => combat.setActor ghost.slot (.tombstoneGhost ghost)) state.combat
   let updated := { updated with
-    itemUse := { timing with itemTime := 15 }, miningHits := strike.hits, combat
+    itemUse := { timing with itemTime := 15 }, hits := adoptHitCache state.hits strike.hits, combat
     worldItems := mined.items, itemRandom := mined.random
     signs := mined.signs, signsChanged := state.signsChanged || mined.signs != state.signs }
   return (updated.adoptTerrain terrain, drop)
@@ -890,7 +1025,7 @@ def State.useCopperPick (state : State) (held : Bool) (target : Option Cell) :
   let updated := { state with
     -- ActuallyUseMiningTool (IL_0413..0423) stores itemTime directly: itemTimeMax keeps its value.
     itemUse := { copperPick.toTiming with itemTimeMax := state.itemUse.itemTimeMax }
-    miningHits := copperPick.hits
+    hits := adoptHitCache state.hits copperPick.hits
     worldItems := mined.items
     itemRandom := mined.random
     chests := mined.chests
@@ -1051,7 +1186,7 @@ private def State.useWallItem (state : State) (selected : Nat) (stack : Original
     let mouse := mouse.getD <| (target.map fun cell =>
       (single (16 * cell.x + 8 : Nat), single (16 * cell.y + 8 : Nat))).getD (0, 0)
     let hammered := OriginalHammerForeground.hammer { work with terrain := work.terrain.trackEdits }
-      stored state.tileFrameNumbers state.hammerHits state.poundRelease state.player.body
+      stored state.tileFrameNumbers state.hits state.poundRelease state.player.body
       state.itemUse stack.item { held, pressed, target, mouse } progress
       (effectsState := state.tileHitEffects)
     let state := state.acceptWallWork { hammered.work with terrain := hammered.work.terrain.finishEdits.1 }
@@ -1068,44 +1203,207 @@ private def State.useWallItem (state : State) (selected : Nat) (stack : Original
       | some push => { body with
           position := { body.position with y := push.y }
           gfxOffY := body.gfxOffY + push.gfxOffY }
-    let (miningHits, swapHits) := match hammered.cleared with
-      | none => (state.miningHits, state.swapHits)
-      | some cell => (state.miningHits.forget cell, state.swapHits.forget cell)
-    let miningHits := if hammered.wallHit.isSome || hammered.cleared.isSome then
-      miningHits.prune (Grid.ofTerrain state.terrain OriginalTileRules.collision) else miningHits
+    -- The hammer works on the shared `Player.hitTile` itself (its ClearMiningCacheAt and prunes reach the
+    -- pickaxe entries natively); ClearMiningCacheAt also clears the cell in `hitReplace`.
+    let swapHits := match hammered.cleared with
+      | none => state.swapHits
+      | some cell => state.swapHits.forget cell
     return { state with
       player := { state.player with body }
-      hammerHits := hammered.hits, itemUse := hammered.timing, poundRelease := hammered.poundRelease
-      miningHits, swapHits }
+      hits := hammered.hits, itemUse := hammered.timing, poundRelease := hammered.poundRelease
+      swapHits }
   let placed := OriginalWallWork.place work stored state.player.body state.itemUse stack held target
     state.tileReplacement progress
   let state := { state.acceptWallWork placed.work with itemUse := placed.timing }
   let state := state.replaceUsedStack selected placed.stack
   return state
 
+-- BEGIN B-ZONE actions-pickaxe (S02)
+/-- `ItemCheck` with a pickaxe through `OriginalPlayerActions.usePickaxe` (the MiningTools leaf's verified
+caller recipe, then `ItemCheck_UseMiningTools`) on the shared `Player.hitTile`.
+
+* The swing sound (`ItemCheck_StartActualUse`, the session's `emitToolSwing`) is drawn first, as for the
+  copper pick; the leaf's own draws (AddDamage, KillTile sound/dust, frame re-roll, drops) follow on the
+  same `Main.rand` (`itemRandom`). Sounds and dust are already resolved inside the shared
+  `OriginalTileHitRuntime.State` (`tileHitEffects`) and reach the window through it: nothing is drawn again.
+* `outcome.unsupported` (a target or neighbour outside the ordinary-block scope: chests, banks,
+  gravestones, trees, platforms, …) is never accepted, whether the leaf refused before any change or
+  stopped partway. The existing owners of those targets are written for the copper pick's power and
+  timing (35, 23 frames), so there is no owner for this pickaxe: the update stops with a boundary.
+* BOUNDARY (declared): `Player.noBuilding` false (no Creative Shock / zone flag in the session);
+  `notTheBeesWorld` / `noTrapsWorld` false (not in the header; only read for tile 137, outside the leaf's
+  scope); the Nightmare Pickaxe's swing dust (8 `Main.rand` draws outside `UseMiningTools`) is not modelled,
+  so a live Nightmare swing stops with a boundary. `cursorItemIconEnabled` is not consumed (as for the copper
+  pick). -/
+private def State.usePickaxe (state : State) (pick : OriginalMiningTools.Pickaxe) (held : Bool)
+    (target : Option Cell) (mouse : Option (Float32 × Float32)) : State := Id.run do
+  let stop (state : State) (why : String) : State := { state with combat := { state.combat with
+      npcBoundary := state.combat.npcBoundary.or (some (0, s!"pickaxe {pick.itemType}: {why}")) } }
+  -- `Player.tileTargetX/Y`: the target cell, else the cursor's world tile
+  let tileTarget : Option (Int × Int) := match target, mouse with
+    | some cell, _ => some (cell.x, cell.y)
+    | none, some (x, y) => some ((x / 16).toInt32.toInt, (y / 16).toInt32.toInt)
+    | none, none => none
+  let some tileTarget := tileTarget
+    | return stop state "no Player.tileTargetX/Y (neither a target cell nor a cursor position)"
+  let state := state.emitToolSwing (state.itemUse.willStart held)
+  let header := state.terrain.header
+  let rules : OriginalMiningTools.Rules := {
+    maxTilesX := header.width, maxTilesY := header.height, worldSurface := header.surface
+    hardMode := header.hardMode, getGoodWorld := header.forTheWorthy, infectedSeed := header.infectedSeed
+    notTheBeesWorld := false, noTrapsWorld := false, tenthAnniversaryWorld := header.tenthAnniversary
+    netMode := 0, generatingWorld := false, tileRangeX := 5, tileRangeY := 3
+    gamepadDisableCursorItemIcon := false }
+  let body := state.player.body
+  let input : OriginalPlayerActions.PickaxeInput := {
+    timing := state.itemUse, held, poundRelease := state.poundRelease
+    position := body.position, width := body.width, height := body.height
+    pickSpeed := (state.equipmentEffects.map (·.pickSpeed)).getD 1
+    noBuilding := false, target := tileTarget }
+  let leafState : OriginalMiningTools.State := {
+    terrain := state.trackTerrain, items := state.worldItems, random := state.itemRandom
+    hits := state.hits, hitReplace := adoptHitCache {} state.swapHits
+    frameNumbers := state.tileFrameNumbers, effects := state.tileHitEffects }
+  let result := OriginalPlayerActions.usePickaxe rules pick input leafState
+  let outcome := result.outcome
+  if let some why := outcome.unsupported then
+    return stop state s!"{why} (no owner for this pickaxe; nothing of the leaf's result was accepted)"
+  if pick.itemType == 103 && result.swing.itemAnimation > 0 then
+    return stop state "Nightmare Pickaxe swing dust (8 Main.rand draws outside UseMiningTools) not modelled"
+  let mined := outcome.state
+  let state := { state with
+    -- a returned itemTime was stored directly; itemTimeMax keeps its value
+    itemUse := result.timing, poundRelease := outcome.poundRelease
+    worldItems := mined.items, itemRandom := mined.random
+    hits := mined.hits, swapHits := hitCacheOf mined.hitReplace
+    tileFrameNumbers := mined.frameNumbers, tileHitEffects := mined.effects }
+  -- the leaf leaves frameX/frameY of re-framed cells to the framing owner (as the copper pick does)
+  let terrain := outcome.events.foldl (init := mined.terrain) fun terrain event =>
+    match event with
+    | .kill x y false =>
+      if x ≥ 0 && y ≥ 0 && (terrain.tile? x.toNat y.toNat).any (·.id.isNone) then
+        OriginalPlacement.reframeAfterRemoval terrain ⟨x.toNat, y.toNat⟩
+      else terrain
+    | _ => terrain
+  return state.adoptTerrain terrain
+-- END B-ZONE actions-pickaxe
+
+-- BEGIN B-ZONE projectiles-bow (S03)
+/-- `Player.ItemCheck` with a bow: `OriginalPlayerActions.useBow` (the released `OriginalBowUse.itemCheck` on the
+UpdatePlayers stream, then the same frame's `NewProjectile` into the session's pool). The launched Wooden Arrow is
+re-entered in its slot as `OriginalCombat.Projectile.woodenArrow` (slot and generation as allocated), so it updates
+in the one projectile loop with the other kinds. `releaseUseItem` is the value the previous ItemCheck left
+(`priorRelease`). BOUNDARY (stops the update, `combat.npcBoundary`): a spawn of a type no module owns (Flaming
+Arrow → `unsupportedSpawn`; its slot is still allocated), a frame without a cursor/camera, a stored prefix that
+`Item.Prefix` rejects, an audible use sound (its `Main.rand` pitch sample falls between the leaf's draws and the
+window has no Item_5 voice). Declared: `reuseDelay` 0, `pendingItemReuse`/`channel` false, `attackCD` 0, ammo
+flags (quivers, ammo box/potion, archery…) false — no producer in the session. -/
+private def State.useBowItem (state : State) (bow : OriginalBowUse.Bow) (stack : OriginalItems.Stack)
+    (held priorRelease : Bool) (mouse : Option (Float32 × Float32))
+    (viewport : Option OriginalForestGuideArrow.Viewport) : State := Id.run do
+  let stop (state : State) (why : String) : State := { state with combat := { state.combat with
+      npcBoundary := state.combat.npcBoundary.or (some (0, s!"bow {stack.item}: {why}")) } }
+  let some view := viewport | return stop state "no camera (Main.screenPosition) for the bow's aim"
+  let some (mx, my) := mouse | return stop state "no cursor position for the bow's aim"
+  -- a prefixed bow: its `Item` with the prefix applied; a rejected prefix would re-roll on Main.rand
+  let bow ← if stack.prefixId == 0 then pure bow else
+    match OriginalPlayerActions.bowFor stack.item stack.prefixId.toNat state.itemRandom with
+    | some (b, rng) =>
+      if rng.state != state.itemRandom.state then return stop state s!"prefix {stack.prefixId} rejected (re-roll)"
+      pure b
+    | none => return stop state s!"prefix {stack.prefixId} unknown"
+  let slotOf (s : Option OriginalItems.Stack) : OriginalBowUse.Slot :=
+    match s with
+    | some st => { type := st.item.toNat, stack := st.count }
+    | none => {}
+  let live (id : Nat) := (state.health.buffType.zip state.health.buffTime).any fun (b, t) => b == id && t > 0
+  let body := state.player.body
+  let frame : OriginalBowUse.Frame := {
+    controlUseItem := held, ccd := live 47 || live 353 || live 149 || live 156
+    mouseX := (mx - view.position.x).toInt32.toInt, mouseY := (my - view.position.y).toInt32.toInt
+    screenPosition := view.position, screenHeight := view.height
+    position := body.position, width := body.width, height := body.height, gfxOffY := body.gfxOffY, gravDir := 1
+    stats := (state.equipmentEffects.map OriginalWeaponStats.Stats.ofEffects).getD {}, flags := {} }
+  let timing := state.itemUse
+  let leafState : OriginalBowUse.State := {
+    itemAnimation := timing.itemAnimation, itemAnimationMax := timing.itemAnimationMax
+    itemTime := timing.itemTime, itemTimeMax := timing.itemTimeMax, reuseDelay := 0
+    releaseUseItem := priorRelease, pendingItemReuse := false, channel := false
+    lastItemUseAttemptSuccess := state.lastItemUseAttemptSuccess, attackCD := 0
+    direction := state.player.direction, itemRotation := state.combat.use.itemRotation
+    revolverCritChanceBonus := state.revolverCritChanceBonus
+    inventory := (state.carriedItems.map slotOf).push (slotOf state.mouseItem) }
+  let result := OriginalPlayerActions.useBow bow frame leafState state.itemRandom state.combat.projectiles 0
+  let out := result.output.state
+  -- the launched arrow joins the one loop as a session projectile kind (same slot, same generation)
+  let mut combat := { state.combat with projectiles := result.pool }
+  if let some arrow := result.launched then
+    combat := combat.setProjectile arrow.slot (.woodenArrow arrow)
+  let back (old : Option OriginalItems.Stack) (slot : OriginalBowUse.Slot) : Option OriginalItems.Stack :=
+    if slotOf old == slot then old
+    else if slot.type == 0 || slot.stack ≤ 0 then none
+    else old.map fun st => { st with count := slot.stack.toNat }
+  let carried := state.carriedItems.mapIdx fun i old => back old (out.inventory[i]?.getD {})
+  let mouseItem := back state.mouseItem (out.inventory[carried.size]?.getD {})
+  let state := { state.setCarriedItems carried with
+    mouseItem, itemRandom := result.output.random
+    itemUse := { itemAnimation := out.itemAnimation.toNat, itemAnimationMax := out.itemAnimationMax.toNat
+                 itemTime := out.itemTime.toNat, itemTimeMax := out.itemTimeMax.toNat }
+    lastItemUseAttemptSuccess := out.lastItemUseAttemptSuccess
+    revolverCritChanceBonus := out.revolverCritChanceBonus
+    player := { state.player with direction := out.direction }
+    combat := { combat with use := { combat.use with
+      releaseUseItem := out.releaseUseItem, itemRotation := out.itemRotation, direction := out.direction } } }
+  let state := match result.unsupportedSpawn with
+    | some spawn => stop state s!"NewProjectile type {spawn.projectileType} (ammo {spawn.usedAmmoItemId}) has no owner"
+    | none => state
+  -- ItemCheck_StartActualUse: PlaySound(item.UseSound) (LegacySoundStyle Item5): one SoundStyle._random sample;
+  -- an audible type-2 call also samples Main.rand for its pitch between the leaf's own draws
+  if result.output.useSound then
+    if let some effects := state.tileHitEffects then
+      if !effects.context.dedicatedServer then
+        let state := { state with pendingStyleSamples := state.pendingStyleSamples + 1 }
+        if effects.context.audioSupported && effects.context.soundVolume != 0 then
+          return stop state "audible use sound: its Main.rand pitch sample is not interleaved with the leaf's draws"
+        return state
+  return state
+-- END B-ZONE projectiles-bow
+
 private def State.useSelected (state : State) (selected : Nat)
-    (held : Bool) (target : Option Cell) (bucketSplashReady : Bool) (mouse : Option (Float32 × Float32)) : State := Id.run do
+    (held : Bool) (target : Option Cell) (bucketSplashReady : Bool) (mouse : Option (Float32 × Float32))
+    (priorRelease : Bool := false) (viewport : Option OriginalForestGuideArrow.Viewport := none) : State := Id.run do
   let pressed := held && !state.wallUseHeld
   let state := { state with wallUseHeld := held }
   let some stack := state.equipped selected
     | return { state with itemUse := state.itemUse.advance false 0 false }
   if OriginalLiquidBuckets.isBucket stack.item then
     return state.useBucket selected stack held target bucketSplashReady
+  -- BEGIN B-ZONE actions-dispatch (S02)
+  -- The copper pick (3509) keeps its verified session path (chest/bank/gravestone routing); the other
+  -- pickaxes go through OriginalPlayerActions.
+  if let .pickaxe pick := OriginalPlayerActions.actionOf stack.item.toNat then
+    if stack.item != OriginalItems.copperPickaxe then
+      return state.usePickaxe pick held target mouse
+  -- END B-ZONE actions-dispatch
+  -- BEGIN B-ZONE projectiles-dispatch (S03)
+  if let .bow bow := OriginalPlayerActions.actionOf stack.item.toNat then
+    return state.useBowItem bow stack held priorRelease mouse viewport
+  -- END B-ZONE projectiles-dispatch
   if stack.item == OriginalItems.copperPickaxe then
     let state := state.emitToolSwing (state.itemUse.willStart held)
     let used := (state.useCopperPick held target).1
     if state.itemUse.itemTime ≤ 1 && used.itemUse.itemTime > 0 then
-      return { used with hammerHits := used.hammerHits.prune used.terrain }
+      return { used with hits := pruneWallHits used.hits used.terrain }
     return used
   if stack.item == OriginalItems.copperAxe then
     let state := state.emitToolSwing (state.itemUse.willStart held)
     let strike := OriginalTree.advance state.trackTerrain state.player.body state.itemUse
-      state.miningHits state.worldItems state.itemRandom held target
+      (hitCacheOf state.hits) state.worldItems state.itemRandom held target
     let state := { state with
       worldItems := strike.felled.items
       itemRandom := strike.felled.random
       itemUse := strike.timing
-      miningHits := strike.hits }
+      hits := adoptHitCache state.hits strike.hits }
     return state.adoptTerrain strike.felled.terrain
   if (OriginalWallWork.Tables.wallItem stack.item).isSome || (OriginalWallWork.Tables.hammerStats stack.item).isSome then
     return state.useWallItem selected stack held pressed target mouse
@@ -1139,7 +1437,7 @@ private def State.useSelected (state : State) (selected : Nat)
     swapHits := result.swapHits }
   let state := state.replaceUsedStack selected result.stack
   let state := if let (some cell, some drop) := (target, result.drop) then
-      { state.spawnGroundDrop cell drop with miningHits := state.miningHits.forget cell }
+      { state.spawnGroundDrop cell drop with hits := adoptHitCache state.hits ((hitCacheOf state.hits).forget cell) }
     else state
   return state.adoptTerrain result.terrain
 
@@ -1322,14 +1620,16 @@ private def State.lootContext (state : State) (grid : Grid) : OriginalCombat.Loo
     -- (`Skyblock.Calculate`, tile 26) is not tracked.
     eyeDefeatedNoAltars := if state.terrain.header.downedEye then none else some false }
 
-private def State.advanceProjectiles (initial : State)
+-- BEGIN B-ZONE projectiles-slot (S03)
+/-- One `Projectile.Update` of slot `index` (the body of the former per-kind loop): a gravestone lands
+through the session (terrain, items, Dig sound); every other kind is `OriginalCombat.advanceProjectile`. -/
+private def State.advanceProjectileSlot (initial : State) (index : Nat)
     (viewport : Option OriginalForestGuideArrow.Viewport)
     (audio : Option OriginalTileHitEffects.Context := none) : State := Id.run do
   let mut state := initial
-  for index in [:state.combat.projectiles.size] do
-    if state.combat.textBoundary.isSome then return state
-    let slot := state.combat.projectiles[index]!
-    if !slot.active then continue
+  do
+    let slot := state.combat.projectileAt index
+    if !slot.active then return state
     let grid := Grid.ofTerrain state.terrain OriginalTileRules.collision
     if let .gravestone grave := slot then
       let result := grave.step grid
@@ -1352,14 +1652,45 @@ private def State.advanceProjectiles (initial : State)
           npcBoundary := state.combat.npcBoundary.or (some (index, why)) } }
       let combat := state.combat
       let random := if result.collided then (combat.projectileRandom.next 0 3).2 else combat.projectileRandom
-      let combat := { combat with
-        projectiles := combat.projectiles.set! index slot, projectileRandom := random }
+      let combat := combat.setProjectile index slot
+      let combat := { combat with projectileRandom := random }
       state := { state with combat }
     else
+      let shooter : OriginalPlayerArrows.Shooter :=
+        { rangedCrit := (state.equipmentEffects.map (·.rangedCrit)).getD 4, luck := state.luck }
       let (combat, drops) := state.combat.advanceProjectile index grid state.player.body
-        state.health.dead (state.lootContext grid) viewport audio
+        state.health.dead (state.lootContext grid) viewport audio shooter
       state := { state with combat, worldItems := drops.foldl OriginalItems.insertDrop state.worldItems }
   return state
+
+/-- `Main.UpdateProjectiles` through ONE `OriginalProjectiles.Pool.update` loop (slots 0..999 ascending,
+the `UpdateProjectiles` stream threaded): every slot is `.other` and runs `advanceProjectileSlot` as the
+`World.updateOther` callback on the whole session, so each kind sees what earlier slots did (NPCs, items,
+terrain, dust, CombatText). A text boundary ends the phase as before (later slots do nothing). An `unowned`
+slot or a projectile boundary stops the update (`combat.npcBoundary`). -/
+private def State.advanceProjectiles (initial : State)
+    (viewport : Option OriginalForestGuideArrow.Viewport)
+    (audio : Option OriginalTileHitEffects.Context := none) : State := Id.run do
+  let world : OriginalProjectiles.World OriginalCombat.Projectile State := {
+    targets := fun _ => #[]
+    applyHit := fun state _ => state
+    updateOther := fun index _ _ state random dustPool =>
+      let state := { state with combat := { state.combat with projectileRandom := random } }
+      let state := if state.combat.textBoundary.isSome then state
+        else state.advanceProjectileSlot index viewport audio
+      let next := state.combat.projectileAt index
+      (some (next.info, next), state, state.combat.projectileRandom, dustPool) }
+  let grid := Grid.ofTerrain initial.terrain OriginalTileRules.collision
+  let phase := initial.combat.projectiles.update { grid } world initial initial.combat.projectileRandom {}
+  let state := phase.world
+  let unowned := phase.events.findSome? fun
+    | .unowned slot type => some s!"projectile slot {slot}: type {type} has no owner (Projectile.Update not modelled)"
+    | _ => none
+  let boundary := (state.combat.projectileBoundary.or unowned).map (0, ·)
+  { state with combat := { state.combat with
+      projectileRandom := phase.random
+      npcBoundary := state.combat.npcBoundary.or boundary } }
+-- END B-ZONE projectiles-slot
 
 /-- `Player.HeldItem.type` as `SceneMetrics.AddPlayerEffects` reads it for the PerspectivePlayer. -/
 private def State.heldType (state : State) : Nat :=
@@ -1393,23 +1724,116 @@ def State.mainUpdateSceneMetrics (state : State) (camera : SceneCamera)
     let metrics := OriginalSceneWaterStyle.scan world state.plainSceneMetrics count center (some area)
     { state with plainSceneMetrics := some metrics }
 
-/-- One actual `Lighting.LightTiles` call, which always reaches `LightingEngine.ProcessArea`.
-Only the engine's state 1 requests the scene metrics; every call advances the state. -/
-def State.lightTiles (state : State) (camera : SceneCamera) : State :=
-  let step := state.sceneClock.processArea
-  let state := { state with sceneClock := step.state }
-  if step.updateSceneMetrics then state.mainUpdateSceneMetrics camera else state
+-- BEGIN B-ZONE lighting-draw (S01)
+/-- The renderer-owned `Main` statics one world draw's `LightTiles` calls read (the session owns the
+rest, see `State.lightingGlobals`). Every field is the actual value of that draw. -/
+structure LightingDraw where
+  /-- `Main.tileColor` written by this draw's `ApplyColorOfTheSkiesToTiles` (DoDraw IL_0735):
+  `OriginalLightingRuntime.tileColorOfSkies` of `ColorOfTheSkies` right after `SetBackColor`
+  (`OriginalForestSkyLighting.Lighting.beforeAtmosphere`, not the post-atmosphere colour). -/
+  tileColor : OriginalLightingRuntime.SColor
+  /-- `Main.mouseTextColor`. -/
+  mouseTextColor : UInt8
+  /-- `Main.DiscoR` / `DiscoG` / `DiscoB`. -/
+  discoR : Int32
+  discoG : Int32
+  discoB : Int32
+  /-- `Main.GlobalTimeWrappedHourly` as the latest `DoUpdate` wrote it. -/
+  globalTimeWrappedHourly : Float32
+  /-- `Main.liquidAlpha` (15 entries) as the previous draw's liquid fade left it. -/
+  liquidAlpha : Array Float32
+  /-- `Main.waterStyle` as the `LightTiles` calls of this draw read it (`UpdateLightDecay`). -/
+  waterStyle : Int32
+  /-- `(frameX, frameY)` of active tiles whose frames the world file does not store: the
+  renderer's framing (`OriginalLightingRuntime.World.frameOf`). -/
+  frameOf : Nat → Nat → OriginalWorld.Tile → Option (Int × Int)
+
+/-- The `Globals` of one `LightTiles` call: the draw's renderer statics plus the session's own
+producers. Fields without an owner in this session are explicit declared values, each a BOUNDARY:
+
+* `shimmerDarken` 0: the `WorldGen.clearWorld` value. `Statics.Shimmer.update` needs the
+  shimmer monolith state, `ZoneShimmer`, the monolith shader and `Player.shimmering`, none of which
+  the session tracks; exact while none of them is ever on.
+* `jellyfishCageMode` all 0: the `.cctor` array. Its only writer `Main.AnimateTiles_CritterCages`
+  has no owner; jellyfish jars (tiles 316–318) light wrongly.
+* `echoMonolith` false (`SceneMetrics.EchoMonolith` is not scanned), `canSeeInvisibleBlocks`
+  `some false` (the perspective player's Spectre-goggles flags are not tracked), `localPlayerBlind`
+  and the decay flags `nightVision`/`blind`/`blackout`/`headcovered` false (`Player.UpdateBuffs` /
+  equipment flags not tracked), `airLightDecay`/`solidLightDecay` 1 (`SceneState` constructor
+  value; writers not traced).
+* `sceneArea` the whole world (`MapHelper.sceneArea` producer not located); it only bounds the
+  minimap exports, which have no writer yet.
+* `mapEnabled` true (the `Main` static's value; the session has no map option), `isCapturing`
+  false (no capture), `netMode` 0 / `myPlayer` 0 (single player). -/
+def State.lightingGlobals (state : State) (draw : LightingDraw) (tileColor : OriginalLightingRuntime.SColor) :
+    OriginalLightingRuntime.Globals :=
+  let header := state.terrain.header
+  let timeCaller := state.forest.bind (·.timeCaller)
+  { tileColor
+    mouseTextColor := draw.mouseTextColor, discoR := draw.discoR, discoG := draw.discoG, discoB := draw.discoB
+    demonTorch := state.tileGlows.demonTorch
+    globalTimeWrappedHourly := draw.globalTimeWrappedHourly
+    timeForVisualEffects := state.timeForVisualEffects
+    -- the world clock as the UpdateTime caller leaves it (the header's saved clock without a forest)
+    dayTime := state.dayTime
+    time := (state.forest.map (·.clock.time)).getD header.time
+    raining := (state.forest.map (·.raining header)).getD header.raining
+    sundialCooldown := Int32.ofInt ((timeCaller.map (·.phase.sundialCooldown)).getD header.timeFlags.sundialCooldown)
+    moondialCooldown := Int32.ofInt ((timeCaller.map (·.phase.moondialCooldown)).getD header.timeFlags.moondialCooldown)
+    shimmerDarken := 0
+    liquidAlpha := draw.liquidAlpha
+    jellyfishCageMode := Array.replicate 75 0
+    netMode := 0, myPlayer := 0
+    echoMonolith := false
+    canSeeInvisibleBlocks := some false
+    localPlayerBlind := false
+    decay := { waterStyle := draw.waterStyle, nightVision := false, blind := false, blackout := false
+               headcovered := false, airLightDecay := 1, solidLightDecay := 1 }
+    -- Hooks.OnWorldLoad sets GameUpdateCount to 65536; DoUpdateInWorld_Inner increments it.
+    gameUpdateCount := (65536 + state.updateCount).toUInt32
+    isCapturing := false
+    mapEnabled := true
+    sceneArea := ⟨0, 0, Int32.ofNat header.width, Int32.ofNat header.height⟩ }
+
+/-- One actual `Lighting.LightTiles(Main.GetAreaToLight())` call (`OriginalLightingRuntime.lightTilesAt`).
+The engine's `_state` 1 requests `Main.UpdateSceneMetrics`, which runs right after the call (phase 1
+does nothing else). A `Fault` is fatal: it is recorded in `lightingFault`, never substituted. -/
+def State.lightTiles (state : State) (camera : SceneCamera) (draw : LightingDraw)
+    (tileColor : OriginalLightingRuntime.SColor) : State :=
+  if state.lightingFault.isSome then state else
+  let world : OriginalLightingRuntime.World := { terrain := state.terrain, frameOf := draw.frameOf }
+  match OriginalLightingRuntime.lightTilesAt state.lighting world (state.lightingGlobals draw tileColor)
+      ⟨camera.position, camera.size⟩ with
+  | .error f => { state with lightingFault := some s!"Lighting.LightTiles: {reprStr f}" }
+  | .ok (lighting, outcome) =>
+    let state := { state with lighting }
+    if outcome.updateSceneMetrics then state.mainUpdateSceneMetrics camera else state
 
 /-- The lighting calls of one world `Main.DoDraw`. `renderNow` first runs two extra passes
-(IL_0390..03bf, writing `renderCount = 99` around them) and is cleared at IL_03cd; the
-ordinary pass follows at IL_0eac. No pause, map, inventory or death branch precedes it. -/
-def State.drawLighting (state : State) (camera : SceneCamera) : State :=
+(IL_0390..03bf, writing `Main.renderCount = 99` around them) and is cleared at IL_03cd; they run
+before this draw's `SetBackColor` and read the previous draw's `Main.tileColor`. The ordinary pass
+follows at IL_0eac with this draw's `tileColor`. No pause, map, inventory or death branch precedes
+it. A renderNow scan pass before any world draw wrote `Main.tileColor` would read the menu's value,
+which the session does not know: that is recorded as a fatal boundary (the first world draw's
+renderNow passes are engine states 0 and 1, which do not read it). -/
+def State.drawLighting (state : State) (camera : SceneCamera) (draw : LightingDraw) : State :=
   let state := if state.renderNow then
       let marked (state : State) : State :=
-        { state with sceneClock := { state.sceneClock with renderCount := 99 } }
-      marked ((marked state).lightTiles camera |>.lightTiles camera)
+        { state with lighting := { state.lighting with
+            statics := { state.lighting.statics with renderCount := 99 } } }
+      let pass (state : State) : State :=
+        match state.tileColor with
+        | some previous => state.lightTiles camera draw previous
+        | none =>
+          if state.lighting.lighting.engine.state == 2 && state.lightingFault.isNone then
+            let why := "BOUNDARY: renderNow scan before any world draw wrote Main.tileColor (menu value unknown)"
+            { state with lightingFault := some why }
+          -- states 0, 1 and 3 never read Main.tileColor
+          else state.lightTiles camera draw draw.tileColor
+      marked (pass (pass (marked state)))
     else state
-  ({ state with renderNow := false } : State).lightTiles camera
+  ({ state with renderNow := false, tileColor := some draw.tileColor } : State).lightTiles camera draw draw.tileColor
+-- END B-ZONE lighting-draw
 
 /-- `Main.StartCameraTransitionForPlayerTeleport` as `Player.Spawn` calls it for the local
 player with no camera pan. At `Main.BlackFadeDist` or beyond, `BlackFadeCameraTeleport` sets
@@ -1426,7 +1850,11 @@ private def State.cameraTeleport (state : State) (origin : OriginalCollision.Vec
   let distance := (dx * dx + dy * dy).toFloat.sqrt.toFloat32
   let diagonal := (camera.size.1 * camera.size.1 + camera.size.2 * camera.size.2).toFloat.sqrt.toFloat32
   if distance ≥ diagonal / 2 + 100 then
-    ({ state with renderNow := true, blackFade := true } : State).mainUpdateSceneMetrics camera
+    -- BEGIN B-ZONE lighting-black-fade (S01)
+    -- `Lighting.Clear()` → `_activeEngine.Clear()`: maps and per-frame lights, `_state` kept.
+    let lighting := { state.lighting with lighting := OriginalLightingEngine.clear state.lighting.lighting }
+    -- END B-ZONE lighting-black-fade
+    ({ state with renderNow := true, blackFade := true, lighting } : State).mainUpdateSceneMetrics camera
   else state
 
 private def State.revive (state : State) (camera : Option SceneCamera := none) : State :=
@@ -1560,6 +1988,36 @@ private def State.checkThrow (state : State) (grid : Grid) (input : ThrowInput) 
     throwStarted := drop.startedAnimation
     throwDelayUse := drop.blockedItemUse || (held && state.throwDelayUse) }
 
+-- BEGIN B-ZONE weapons-numbers (S04)
+/-- Buffs whose `UpdateBuffs` changes a `Player` field `GetWeaponDamage/Crit/Knockback` read (Archery 16,
+Tipsy 25, Well Fed 26/206/207, Clairvoyance 29, Magic Power 7, Titan 114, Rage 115, Wrath 117). Declared list,
+not read from the CIL: the session has no producer for these fields, so a live one is a boundary. -/
+def weaponStatBuffs : Array Nat := #[7, 16, 25, 26, 29, 114, 115, 117, 206, 207]
+
+/-- `Player.GetWeaponDamage/Crit/Knockback` of the held stack through `OriginalPlayerActions.weaponNumbers`.
+
+* The item instance is `SetDefaults(type)` + `Item.Prefix(prefix byte)` (`OriginalPlayerActions.weaponItem`) with the
+  prefix byte the inventory holds (from the player file). A valid prefix draws nothing. A prefix `Prefix` rejects
+  re-rolls natively when the player file is loaded (`Player.LoadPlayer`, on the menu thread's global `Main.rand`, a
+  stream whose state at the character list the session does not know): that is refused as a boundary here, never
+  re-rolled on a session stream.
+* `Stats` = `OriginalWeaponStats.Stats.ofEffects` of this update's `UpdateEquips`; buff / glove / stealth fields keep
+  their `ResetEffects` values, so a live `weaponStatBuffs` buff is a boundary.
+* Root note: magic / ranged crit from equipment (effects-minion-crit) is a coverage hole of the equipment leaf; this
+  path is wired for the melee starter weapons and is not evidence for magic/ranged crit. -/
+def State.heldWeaponNumbers (state : State) (stack : OriginalItems.Stack) :
+    Except String OriginalPlayerActions.WeaponNumbers := do
+  let some (item, rng) := OriginalPlayerActions.weaponItem stack.item stack.prefixId.toNat state.itemRandom
+    | throw s!"item {stack.item} prefix {stack.prefixId}: no SetDefaults/Prefix result"
+  if rng.state != state.itemRandom.state then
+    throw s!"item {stack.item} prefix {stack.prefixId}: rejected at load (re-roll on the menu-thread Main.rand is not modelled)"
+  let live (id : Nat) := (state.health.buffType.zip state.health.buffTime).any fun (b, t) => b == id && t > 0
+  if let some id := weaponStatBuffs.find? live then
+    throw s!"buff {id} changes weapon stats; its effect is not applied"
+  let stats := (state.equipmentEffects.map OriginalWeaponStats.Stats.ofEffects).getD {}
+  return OriginalPlayerActions.weaponNumbers stats item
+-- END B-ZONE weapons-numbers
+
 private def State.updateSelectedItem (state : State) (grid : Grid) (selected : Nat)
     (held : Bool) (target : Option Cell) (bucketSplashReady : Bool)
     (mouse : Option (Float32 × Float32)) (viewport : Option OriginalForestGuideArrow.Viewport) : State :=
@@ -1570,6 +2028,15 @@ private def State.updateSelectedItem (state : State) (grid : Grid) (selected : N
   let stack := state.equipped selected
   match stack.bind (fun item => OriginalStarterMelee.weaponOf? item.item.toNat) with
   | some weapon =>
+    -- BEGIN B-ZONE weapons-melee (S04): damage / crit / knockback from weaponNumbers. The leaf applies
+    -- `meleeDamage` itself (`(int)(damage * meleeDamage + 5e-6f)`), so it gets the final damage with
+    -- `meleeDamage` 1 (the same expression), the final knockback with multiplier 1 and the crit chance.
+    let (state, weapon, meleeCrit) := match stack.map state.heldWeaponNumbers with
+      | some (.ok n) => (state, { weapon with damage := n.damage.toNat, knockBack := n.knockback }, n.crit)
+      | some (.error why) => ({ state with combat := { state.combat with
+          npcBoundary := state.combat.npcBoundary.or (some (0, s!"weapon numbers: {why}")) } }, weapon, 4)
+      | none => (state, weapon, 4)
+    -- END B-ZONE weapons-melee
     let body := state.player.body
     let position := match mouse with
       | some (x, y) => ⟨x, y⟩
@@ -1579,10 +2046,11 @@ private def State.updateSelectedItem (state : State) (grid : Grid) (selected : N
     -- when this update starts a use, the swing's own draws come first. The start is decided on
     -- the stream as it is now; nothing of that probe is kept.
     let probe := state.combat.useWeapon weapon body state.player.direction
-      mayUse position grid state.itemRandom (state.lootContext grid) viewport (noItems := noStart)
+      mayUse position grid state.itemRandom (state.lootContext grid) viewport (noItems := noStart) (meleeCrit := meleeCrit)
     let state := state.emitToolSwing (probe.1.use.itemAnimation > state.combat.use.itemAnimation)
     let (combat, drops, itemRandom) := state.combat.useWeapon weapon body state.player.direction
       mayUse position grid state.itemRandom (state.lootContext grid) viewport (noItems := noStart) (audio := audio)
+      (meleeCrit := meleeCrit)
     let use := combat.use
     { state with
       combat, itemRandom, wallUseHeld := mayUse && target.isSome
@@ -1591,12 +2059,16 @@ private def State.updateSelectedItem (state : State) (grid : Grid) (selected : N
       itemUse := { itemAnimation := use.itemAnimation, itemAnimationMax := use.itemAnimationMax
                    itemTime := use.itemTime, itemTimeMax := use.itemTimeMax } }
   | none =>
+    -- BEGIN B-ZONE projectiles-release (S03): the release latch as the previous ItemCheck left it
+    let priorRelease := state.combat.use.releaseUseItem
+    -- END B-ZONE projectiles-release
     let use := { state.combat.use with releaseUseItem := !mayUse, itemAnimation := 0 }
     let state := { state with combat := { state.combat with use, weapon := none } }
     -- Tool helpers renew at animation 1. Block that renewal while finishing the old swing.
     let canContinue := !noStart || state.itemUse.itemAnimation > 1
     let before := state.itemUse
     let used := state.useSelected selected (mayUse && target.isSome && canContinue) target bucketSplashReady mouse
+      priorRelease viewport
     let timing := if noStart && before.itemAnimation == 1 then
         { used.itemUse with itemAnimationMax := before.itemAnimationMax }
       else used.itemUse
@@ -1761,6 +2233,118 @@ private def State.fallBlock (state : State) (grid : Grid) (before : Health)
   if tail.boundary.isSome then return state
   return if tail.record.lethal then state.registerDeath grid none viewport (some 0) client else state
 
+-- BEGIN B-ZONE actions-quick (S02)
+/-- `LegacySoundPlayer.PlaySound(2, x, y, style)` for the potion use sounds (Item2 / Item3): the same gates
+and volume/pan as the verified swing (`OriginalItemUseSound.playSwing`), no voice choice (that is style 1
+only, IL_04ab), then the ordinary pitch sample `Next(-6, 7) * 0.01` (IL_0738..074b). Styles with their own
+volume / pitch branches are refused by the caller. -/
+private def playPotionSound (style : Nat) (x y : Int) (context : OriginalTileHitEffects.Context)
+    (random : UnifiedRandom) : Option OriginalTileHitEffects.PlayedSound × UnifiedRandom := Id.run do
+  if context.dedicatedServer || !context.audioSupported || context.soundVolume == 0 then
+    return (none, random)
+  let global := x == -1 || y == -1
+  if !global && (context.generating || context.netMode == 2) then return (none, random)
+  let offset : OriginalCollision.Vector := ⟨single x - context.cameraCenter.x, single y - context.cameraCenter.y⟩
+  let distance := Float32.sqrt (offset.x * offset.x + offset.y * offset.y)
+  if !global && !(distance < context.attenuationDistance) then return (none, random)
+  let clamp (lo hi v : Float32) : Float32 := if v < lo then lo else if v > hi then hi else v
+  let pan := if global then 0 else clamp (-1) 1 (offset.x / (context.maxWorldViewWidth * 0.5))
+  let volume := if global then 1 else 1 - distance / context.attenuationDistance
+  let volume := min 1 (clamp 0 1 volume * context.soundVolume)
+  if !(volume > 0) then return (none, random)
+  let (pitch, random) := random.next (-6) 7
+  return (some { request := { typeId := 2, x, y, style }, variation := 0, volume, pan
+                 pitch := clamp (-1) 1 (single pitch * 0.01) }, random)
+
+/-- `Player.Update` IL_0d87..0dd3 through `OriginalPlayerActions.quickKeys`: the QuickHeal gate, then the
+QuickMana gate. The two gates are independent (each reads and writes only its own control/release pair), so
+the session runs them as two `quickKeys` calls, one with only that key's control, and takes each gate's own
+release from its call. Each `QuickHeal` / `QuickMana` call's first effect is `PlaySound(item.UseSound,
+position)`; with window audio that call draws its pitch from `Main.rand` BEFORE the call's own draws, so a
+call that turns out to play a sound is evaluated again from the stream after the pitch sample (the leaf
+draws nothing before its sound). It also takes one `SoundStyle._random` sample (the LegacySoundStyle
+overload), like `emitToolSwing`.
+
+The `HealingPotions.Player` is assembled from the session: life/mana/buffs (`health`, flags as the previous
+`UpdateBuffs` left them), `statManaMax2`, the delays, inventory 0–57 plus the cursor as slot 58, the Void Vault
+as `bank4`, mana heat and the body. BOUNDARY (declared): `pStone` false (Philosopher's Stone / Charm of Myths
+are not modelled by the equipment owner), `pending` false (no pending inventory actions in the session), the
+crowd-control flags from the live buffs 47/353, 149, 156 and `manaSick` from 94 (a buff that ran out in the
+previous update is not seen); an `achievement` effect (Bottled Water at breath 0) stops the update. -/
+private def State.quickKeys (state : State) (client : Option ClientInput) : State := Id.run do
+  let controlHeal := (client.map (·.controlQuickHeal)).getD false
+  let controlMana := (client.map (·.controlQuickMana)).getD false
+  let stop (state : State) (why : String) : State := { state with combat := { state.combat with
+      npcBoundary := state.combat.npcBoundary.or (some (0, s!"QuickHeal/QuickMana: {why}")) } }
+  let slotOf (s : Option OriginalItems.Stack) : OriginalHealingPotions.Slot :=
+    match s with
+    | some st => { type := st.item.toNat, stack := st.count }
+    | none => {}
+  let live (id : Nat) := (state.health.buffType.zip state.health.buffTime).any fun (b, t) => b == id && t > 0
+  let body := state.player.body
+  let player : OriginalHealingPotions.Player := {
+    health := state.health, statManaMax2 := state.statManaMax2
+    potionDelay := state.potionDelay, manaPotionDelay := state.manaPotionDelay
+    pStone := false, pending := false
+    frozen := live 47 || live 353, webbed := live 149, stoned := live 156, manaSick := live 94
+    inventory := (state.carriedItems.map slotOf).push (slotOf state.mouseItem)
+    bank4 := state.banks.voidVault.map slotOf
+    manaHeat := state.manaHeat
+    position := body.position, width := body.width, height := body.height }
+  let audio := state.tileHitEffects.map (·.context) |>.filter (!·.dedicatedServer)
+  -- one gate; `heal` selects which key's control this call carries
+  let gate (heal : Bool) (player : OriginalHealingPotions.Player) (rng : OriginalPlayerLiquidHealth.Rng) :
+      OriginalPlayerActions.QuickResult :=
+    OriginalPlayerActions.quickKeys player rng
+      { controlQuickHeal := heal && controlHeal, releaseQuickHeal := state.releaseQuickHeal
+        controlQuickMana := !heal && controlMana, releaseQuickMana := state.releaseQuickMana }
+  let mut state := state
+  let mut player := player
+  let mut rng := state.playerTextRng
+  let mut releaseHeal := state.releaseQuickHeal
+  let mut releaseMana := state.releaseQuickMana
+  let mut called := false
+  for heal in [true, false] do
+    let first := gate heal player rng
+    if !first.effects.isEmpty then called := true
+    let mut result := first
+    for effect in first.effects do
+      match effect with
+      | .sound soundId style position volumeScale pitchOffset =>
+        if soundId != 2 || (style != 2 && style != 3) || volumeScale != 1 || pitchOffset != 0 then
+          return stop state s!"PlaySound({soundId}, style {style}, volume {volumeScale}, pitch {pitchOffset}) not resolved"
+        let x := position.x.toInt32.toInt
+        let y := position.y.toInt32.toInt
+        state := { state with quickSoundRequests := state.quickSoundRequests.push { typeId := 2, x, y, style } }
+        if let some context := audio then
+          state := { state with pendingStyleSamples := state.pendingStyleSamples + 1 }
+          let (played, stream) := playPotionSound style x y context rng.stream
+          if let some played := played then
+            state := { state with quickSounds := state.quickSounds.push played }
+            result := gate heal player { rng with stream, draws := rng.draws + 1 }
+      | .achievement event =>
+        return stop state s!"achievement event {event} not wired"
+      | _ => pure ()
+    player := result.player
+    rng := result.rng
+    if heal then releaseHeal := result.keys.releaseQuickHeal else releaseMana := result.keys.releaseQuickMana
+  -- no QuickHeal/QuickMana got past its gates: only the latches change
+  if !called then return { state with releaseQuickHeal := releaseHeal, releaseQuickMana := releaseMana }
+  -- write the potion player back: life/mana/buffs, delays, heat, the consumed slot
+  let back (old : Option OriginalItems.Stack) (slot : OriginalHealingPotions.Slot) : Option OriginalItems.Stack :=
+    if slotOf old == slot then old
+    else if slot.type == 0 || slot.stack ≤ 0 then none
+    else old.map fun st => { st with count := slot.stack.toNat }
+  let carried := state.carriedItems.mapIdx fun i old => back old (player.inventory[i]?.getD {})
+  let mouseItem := back state.mouseItem (player.inventory[carried.size]?.getD {})
+  let voidVault := state.banks.voidVault.mapIdx fun i old => back old (player.bank4[i]?.getD {})
+  let written := { state.setCarriedItems carried with
+    health := player.health, potionDelay := player.potionDelay, manaPotionDelay := player.manaPotionDelay
+    manaHeat := player.manaHeat, mouseItem, banks := { state.banks with voidVault }
+    releaseQuickHeal := releaseHeal, releaseQuickMana := releaseMana }
+  return written.acceptTextRng rng
+-- END B-ZONE actions-quick
+
 private def State.updatePlayer (state : State) (grid : Grid) (input : Controls) (selected : Nat)
     (held : Bool) (target : Option Cell) (bucketSplashReady : Bool) (mouse : Option (Float32 × Float32))
     (throwInput : Option ThrowInput) (viewport : Option OriginalForestGuideArrow.Viewport)
@@ -1775,6 +2359,12 @@ private def State.updatePlayer (state : State) (grid : Grid) (input : Controls) 
   let state := { state with
     itemRandom := visual.random
     combat := { state.combat with manaDust := state.combat.manaDust ++ visual.particles } }
+  -- BEGIN B-ZONE actions-potion-delay (S02)
+  -- Player.Update IL_0a7a..0aa8, before the dead branch: the potion delays count down.
+  let state := { state with
+    potionDelay := if state.potionDelay > 0 then state.potionDelay - 1 else state.potionDelay
+    manaPotionDelay := if state.manaPotionDelay > 0 then state.manaPotionDelay - 1 else state.manaPotionDelay }
+  -- END B-ZONE actions-potion-delay
   if state.health.dead then
     let (health, event) := state.health.deadFrame
     let state := { state with
@@ -1783,6 +2373,14 @@ private def State.updatePlayer (state : State) (grid : Grid) (input : Controls) 
       manaHeat := state.manaHeat.updateEffects 0 }
     -- The local control block (IL_0bb0..1882) is not reached: no CopyInto, Select or Update.
     return if event.isSome then state.revive (client.bind (·.camera)) else state
+  -- BEGIN B-ZONE actions-quick-keys (S02)
+  -- IL_0d87..0dd3: after the (unmodelled) isOperatingAnotherEntity control clear, before
+  -- controlCreativeMenu, Select and dropItemCheck; flags are still the previous UpdateBuffs'.
+  let quick := state.quickKeys client
+  if quick.combat.textBoundary.isSome ||
+      (quick.combat.npcBoundary.isSome && state.combat.npcBoundary.isNone) then return quick
+  let state := quick
+  -- END B-ZONE actions-quick-keys
   -- UpdateBuffs applies the control flags even on the tick it decrements a buff to zero.
   let healthBeforeReset := state.health
   let state := { state with health := state.health.resetEffects }
@@ -1823,6 +2421,12 @@ private def State.updatePlayer (state : State) (grid : Grid) (input : Controls) 
     else if state.throwStarted then (throwInput.map (·.priorSelected)).getD selected else selected
   -- `UpdateEquips` and `UpdateArmorSets` (Player.Update IL_248f..264b) run between UpdateBuffs and
   -- UpdateLifeRegen: the equipment's `lifeRegen` and `statLifeMax2` are in place when life regenerates.
+  -- BEGIN B-ZONE actions-potion-sickness (S02)
+  -- UpdateBuffs IL_3f89..3fa3: a live Potion Sickness (21) writes its decremented time into potionDelay.
+  let state := match (state.health.buffType.zip state.health.buffTime).find? (fun (b, t) => b == 21 && t > 0) with
+    | some (_, t) => { state with potionDelay := t - 1 }
+    | none => state
+  -- END B-ZONE actions-potion-sickness
   let buffed := state.health.updateBuffs
   let effects := OriginalPlayerEquipment.update state.equipment (state.equipmentContext buffed)
   let state := { state with equipmentEffects := some effects }
@@ -2222,6 +2826,16 @@ def State.drawCloudAlpha (state : State) : State :=
           let cloudAlpha := OriginalRainAtmosphere.drawCloudAlpha rain.cloudAlpha rain.strength rain.active false rate
           { tc with phase := { tc.phase with world := { tc.phase.world with rain := { rain with cloudAlpha } } } } } }
 
+/-- What the desktop's draw computed for the weather: `Main.waterStyle` (the scene water style chain) and the
+ambient waterfall / lavafall sources the last `DrawWaterfall` wrote (`none`: no DrawWaterfall call this draw,
+the statics keep their values). -/
+def State.noteDrawnScene (state : State) (waterStyle : Int) (ambient : Option OriginalForest.AmbientSources) : State :=
+  { state with forest := state.forest.map fun forest =>
+      { forest with waterStyle := some waterStyle, weather := forest.weather.map fun w =>
+          match ambient with
+          | some sources => { w with ambientSources := sources }
+          | none => w } }
+
 /-- DoDraw IL_13ff `Main.DrawRain` (il/Main.DrawRain.il): every active drop's sprite, then `Rain.Update`
 on the unscoped `Main.rand` (the weather stream); a drop's splash is one `Dust.NewDust` of the water cohort
 with the draw-time camera and the `Rain.Update` post-block (`OriginalWaterDust.splash`). `lightAt` is
@@ -2272,6 +2886,14 @@ private def State.stepWith (state : State) (input : Controls) (selected : Nat)
     (projectileViewport : Option OriginalForestGuideArrow.Viewport) (talkNPC : Int)
     (client : Option ClientInput) : State :=
   if state.combat.textBoundary.isSome then state else
+  -- BEGIN B-ZONE lighting-update-statics (S01)
+  -- A lighting fault is fatal (no further update). Main.DoUpdate IL_0873 `DoUpdate_AnimateTileGlows`
+  -- (demonTorch) and IL_08cc `timeForVisualEffects`, before DoUpdateInWorld; neither reads the world.
+  if state.lightingFault.isSome then state else
+  let state := { state with
+    tileGlows := state.tileGlows.update
+    timeForVisualEffects := OriginalLightingRuntime.Statics.stepTimeForVisualEffects state.timeForVisualEffects }
+  -- END B-ZONE lighting-update-statics
   let openStorage := state.openStorage.filter fun storage => match storage with
     | .chest index => state.chests[index]?.any (OriginalChests.inOpenRange state.terrain state.player.body)
     | .bank furniture => OriginalBanks.inOpenRange state.terrain state.player.body furniture
@@ -2287,6 +2909,9 @@ private def State.stepWith (state : State) (input : Controls) (selected : Nat)
     pickupSoundRequests := #[], pickupSounds := #[]
     candlePlacementSound := none
     selectionMenuTick := false, blackFade := false
+    -- BEGIN B-ZONE actions-update-reset (S02)
+    quickSoundRequests := #[], quickSounds := #[]
+    -- END B-ZONE actions-update-reset
     -- DoUpdateInWorld_Inner increments GameUpdateCount before anything else.
     updateCount := state.updateCount + 1
     combat := {state.combat.updateProtectedSpawnSlots with
@@ -2330,8 +2955,14 @@ private def State.stepWith (state : State) (input : Controls) (selected : Nat)
     | some forest =>
       let heldItem := ((state.equipped selected).map (fun (stack : OriginalItems.Stack) => stack.item)).getD 0
       -- `Spawner.SetSpawnFlags` IL_002c copies `Player.luck` from this update's UpdateLuck.
+      -- `SetSpawnFlags` IL_0372 offensiveToTim: a robe in GetEffectiveArmor(1), no Wizard Hat in GetEffectiveArmor(0)
+      let (head, headOpen) := OriginalPlayerEquipment.effectiveArmor state.equipment 0
+      let (bodyArmor, bodyOpen) := OriginalPlayerEquipment.effectiveArmor state.equipment 1
+      let offensiveToTim : Option Bool := if headOpen.isSome || bodyOpen.isSome then none else
+        let robe := bodyArmor.item == 4256 || (1282 ≤ bodyArmor.item && bodyArmor.item ≤ 1287)
+        some (robe && !bodyArmor.isAir && head.item != 238)
       let (forest, combat) := forest.spawn state.terrain world body state.health.dead heldItem state.combat state.luck
-        (some state.health.statLifeMax)
+        (some state.health.statLifeMax) offensiveToTim
       { state with forest := some forest, combat }
   let combat := state.combat.advanceNpcs world body state.health.dead
     state.itemUse.itemAnimation (state.lootContext grid) townWorld
@@ -2444,6 +3075,23 @@ private def State.stepWith (state : State) (input : Controls) (selected : Nat)
   let combat := if combat.textContext.netMode == (2 : Int) then combat
     else {combat with texts := combat.texts.advance}
   let state := { state with combat, manaRefillLights, dustLights }
+  -- BEGIN B-ZONE lighting-add-lights (S01)
+  -- `Lighting.AddLight` enqueues `_perFrameLights` at the call: the held item's lights of
+  -- Player.Update (`AddLight(Vector2, …)`) before the Dust phase's (`AddLight(int, int, …)`).
+  -- `Main.gamePaused` false and `netMode` 0 (single-player session without a pause).
+  let state : State := Id.run do
+    let mut rt := state.lighting
+    for light in state.heldItemLights do
+      match OriginalLightingRuntime.addLightAt rt false 0 (light.position.x, light.position.y)
+          light.r light.g light.b with
+      | .ok next => rt := next
+      | .error f => return { state with lightingFault := some s!"Lighting.AddLight(Vector2): {reprStr f}" }
+    for light in dustLights do
+      rt := OriginalLightingRuntime.addLight rt false 0 (Int32.ofInt light.x) (Int32.ofInt light.y)
+        light.r light.g light.b
+    return { state with lighting := rt }
+  if state.lightingFault.isSome then state else
+  -- END B-ZONE lighting-add-lights
   let state := if state.forest.any (·.timeCaller.isSome) then state.advanceTimeCaller header client else
     let state := { state with
       forest := state.forest.map fun forest =>
@@ -2487,7 +3135,9 @@ def State.enterClient (state : State) (camera : Option SceneCamera := none) : St
   -- A new Player's releaseUseItem is false until its first ItemCheck writes `!controlUseItem`.
   let state := { state with
     selectionLive := true, renderNow := true
-    sceneClock := { state.sceneClock with mapDelay := 2 }
+    -- BEGIN B-ZONE lighting-enter (S01)
+    lighting := { state.lighting with statics := { state.lighting.statics with mapDelay := 2 } }
+    -- END B-ZONE lighting-enter
     combat := { state.combat with use := { state.combat.use with releaseUseItem := false } } }
   match camera with
   | none => state

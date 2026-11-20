@@ -1,3 +1,5 @@
 /.lake/
 /dist/
 .DS_Store
+/.lake
+/.lake.nosync/

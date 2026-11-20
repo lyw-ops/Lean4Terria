@@ -10,6 +10,11 @@ lean_lib Lean4Terria
 lean_exe lean4terria_test where
   root := `Tests
 
+-- BEGIN B-ZONE tests-player (S00: main B's regression, TestsPlayer.lean)
+lean_exe «tests-player» where
+  root := `TestsPlayer
+-- END B-ZONE tests-player
+
 input_file raylibArchive where
   path := ".lake/raylib-6.2_macos/lib/libraylib.a"
   text := false

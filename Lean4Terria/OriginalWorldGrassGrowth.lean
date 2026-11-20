@@ -147,9 +147,10 @@ partial def spreadGrass (t : Tables) (s : State) (i j : Int) (dirt grass : Nat) 
   if !t.clearable c.type then return s
   if infectious grass then return s.fail "SpreadGrass: infectious grass needs Convert"
   if dirt > 0 && t.conversionGrass dirt then return s.fail "SpreadGrass: Conversion.Grass[dirt] needs Convert"
-  -- TryConvertingOrKillingTreesAboveIfTheyWouldBecomeInvalid: only acts on a tree or palm above
+  -- TryConvertingOrKillingTreesAboveIfTheyWouldBecomeInvalid: only acts on a tree or palm above; a forest tree (5) on
+  -- plain grass stays valid (Conversion.Grass[2] and the tree ground test), checked natively
   let above := w.cell i (j - 1)
-  if w.inWorld i j 2 && above.active && (t.isTree above.type || above.type == 323) then
+  if w.inWorld i j 2 && above.active && (t.isTree above.type || above.type == 323) && !(above.type == 5 && grass == 2) then
     return s.fail "SpreadGrass: tree above needs TryConvertingOrKillingTreesAbove"
   let mut s := s
   s := { s with world := w.setCell i j { c with type := grass },

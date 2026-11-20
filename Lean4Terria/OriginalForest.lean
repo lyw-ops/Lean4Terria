@@ -427,6 +427,8 @@ private def World.ofTerrain (state : State) (terrain : Terrain)
       (combat.actors.filterMap (·.dungeonSpikeBall?))
     noSpawnCycle := combat.noSpawnCycle, tileSolid, tileSolidTop, wallHouse
     inheritTypeOfTileBelow := inheritBelow, desertWalls, offFlags := flags
+    -- `Main.worldID` (WorldFileData.WorldId, saved as an int) and `NPC.savedStylist`
+    worldID := some (Int32.ofUInt32 h.id).toInt, savedStylist := h.timeFlags.savedStylist
     night := do
       let (halloween, xMas) ← state.season
       let lifeMax ← statLifeMax
@@ -484,7 +486,8 @@ def State.trackAfk (state : State) (body : Body) (dead : Bool) (itemAnimation : 
 
 def State.spawn (state : State) (terrain : Terrain) (world : OriginalGreenSlime.World)
     (body : Body) (dead : Bool) (heldItem : UInt16)
-    (combat : OriginalCombat.State) (luck : Float32 := 0) (statLifeMax : Option Int := none) :
+    (combat : OriginalCombat.State) (luck : Float32 := 0) (statLifeMax : Option Int := none)
+    (offensiveToTim : Option Bool := none) :
     State × OriginalCombat.State :=
   let previous := combat
   let combat := { combat with noSpawnCycle := false }
@@ -496,7 +499,7 @@ def State.spawn (state : State) (terrain : Terrain) (world : OriginalGreenSlime.
     width := body.width, height := body.height, nearbyActiveNPCs := combat.nearbyActiveNPCs
     townNPCs := state.townNPCs, heldItem := heldItem.toNat, afkCounter := state.afkCounter, luck
     candleZones := state.candleZones
-    offFlags := state.playerFlags }
+    offFlags := state.playerFlags, offensiveToTim }
   let (result, trace) := OriginalForestSpawn.attempt (World.ofTerrain state terrain previous statLifeMax) player state.spawnRandom
   let state := { state with spawnRandom := trace.rng }
   match result with
